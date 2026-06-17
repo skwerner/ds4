@@ -73,11 +73,13 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA ||
+           backend == DS4_BACKEND_SYCL;
 }
 
 static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
+    if (backend == DS4_BACKEND_SYCL) return true;
     if (backend == DS4_BACKEND_CUDA) {
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
         return true;
@@ -90,6 +92,7 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
+    if (backend == DS4_BACKEND_SYCL) return true;
 #ifdef DS4_ROCM_BUILD
     if (backend == DS4_BACKEND_CUDA) return true;
 #else
@@ -20384,6 +20387,7 @@ static bool metal_graph_prefill_layer_major(
                 fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
                 fflush(stderr);
             }
+            ds4_gpu_clear_cached_model_ranges();
         }
         if (show_progress) fputc('\n', stderr);
         if (display_progress)
@@ -20794,6 +20798,7 @@ static bool metal_graph_prefill_layer_major(
             fprintf(stderr, "ds4: gpu prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
             fflush(stderr);
         }
+        ds4_gpu_clear_cached_model_ranges();
     }
     if (!ok) {
 #ifdef DS4_ROCM_BUILD
@@ -21154,6 +21159,7 @@ static bool metal_graph_verify_suffix_tops(
                                             il,
                                             start,
                                             n_tokens);
+        ds4_gpu_clear_cached_model_ranges();
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -23132,6 +23138,7 @@ const char *ds4_backend_name(ds4_backend backend) {
 #else
         return "cuda";
 #endif
+    case DS4_BACKEND_SYCL:  return "sycl";
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
@@ -25717,6 +25724,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
 #endif
     }
+    if (e->backend == DS4_BACKEND_SYCL) {
+#ifndef DS4_SYCL_BUILD
+        fprintf(stderr, "ds4: SYCL backend requested but this build is not linked with a SYCL device compiler\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
     if (graph_backend) {
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
@@ -26556,6 +26571,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                             il,
                                             pos0,
                                             n_tokens);
+        ds4_gpu_clear_cached_model_ranges();
     }
     if (ok && output_logits) {
         saved_cur = g->cur_hc;

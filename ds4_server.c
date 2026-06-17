@@ -11472,6 +11472,7 @@ static void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "sycl")) return DS4_BACKEND_SYCL;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -11481,6 +11482,8 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
 #ifdef DS4_ROCM_BUILD
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
+#elif defined(DS4_SYCL_BUILD)
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, sycl, cpu");
 #else
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
 #endif
@@ -11492,6 +11495,8 @@ static ds4_backend default_server_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_SYCL_BUILD)
+    return DS4_BACKEND_SYCL;
 #else
     return DS4_BACKEND_CUDA;
 #endif

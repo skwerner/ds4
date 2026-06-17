@@ -164,6 +164,7 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "sycl")) return DS4_BACKEND_SYCL;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -173,6 +174,8 @@ static ds4_backend parse_backend(const char *s) {
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
 #ifdef DS4_ROCM_BUILD
     fprintf(stderr, "ds4: valid backends are: metal, rocm, cpu\n");
+#elif defined(DS4_SYCL_BUILD)
+    fprintf(stderr, "ds4: valid backends are: metal, sycl, cpu\n");
 #else
     fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
 #endif
@@ -184,6 +187,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_SYCL_BUILD)
+    return DS4_BACKEND_SYCL;
 #else
     return DS4_BACKEND_CUDA;
 #endif

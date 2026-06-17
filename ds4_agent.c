@@ -475,6 +475,7 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "sycl")) return DS4_BACKEND_SYCL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
@@ -486,6 +487,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_SYCL_BUILD)
+    return DS4_BACKEND_SYCL;
 #else
     return DS4_BACKEND_CUDA;
 #endif

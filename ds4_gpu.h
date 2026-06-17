@@ -21,6 +21,7 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+void ds4_gpu_clear_cached_model_ranges(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

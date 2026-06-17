@@ -150,6 +150,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
+#elif defined(DS4_SYCL_BUILD)
+    opt(fp, c, "--metal | --sycl | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal, sycl, or cpu.");
 #else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
@@ -162,9 +165,15 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
-    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
+#ifdef DS4_ROCM_BUILD
+    opt(fp, c, "--ssd-streaming", "Metal/ROCm: opt in to SSD-backed model streaming instead of full residency.");
+#elif defined(DS4_SYCL_BUILD)
+    opt(fp, c, "--ssd-streaming", "Metal/SYCL: opt in to SSD-backed model streaming instead of full residency.");
+#else
+    opt(fp, c, "--ssd-streaming", "Metal/CUDA: opt in to SSD-backed model streaming instead of full residency.");
+#endif
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Metal/ROCm default: 80% working set minus non-routed weights; CUDA default: backend fixed cache.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");

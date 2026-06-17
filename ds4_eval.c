@@ -1470,6 +1470,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static ds4_backend parse_backend(const char *s, const char *opt) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "sycl")) return DS4_BACKEND_SYCL;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
 #else
@@ -1479,6 +1480,8 @@ static ds4_backend parse_backend(const char *s, const char *opt) {
     fprintf(stderr, "ds4-eval: invalid value for %s: %s\n", opt, s);
 #ifdef DS4_ROCM_BUILD
     fprintf(stderr, "ds4-eval: valid backends are: metal, rocm, cpu\n");
+#elif defined(DS4_SYCL_BUILD)
+    fprintf(stderr, "ds4-eval: valid backends are: metal, sycl, cpu\n");
 #else
     fprintf(stderr, "ds4-eval: valid backends are: metal, cuda, cpu\n");
 #endif
@@ -1490,6 +1493,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_SYCL_BUILD)
+    return DS4_BACKEND_SYCL;
 #else
     return DS4_BACKEND_CUDA;
 #endif

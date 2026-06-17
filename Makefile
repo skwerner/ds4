@@ -35,12 +35,15 @@ HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+DPCPP ?= icpx
+SYCL_CFLAGS ?= -O3 -ffast-math -g -fsycl -I$(MKLROOT)/include
+SYCL_LDLIBS ?= -lm -pthread -lsycl -L$(MKLROOT)/lib -lmkl_sycl -lmkl_intel_ilp64 -lmkl_gnu_thread -lmkl_core -lgomp -ldl
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -86,6 +89,7 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make sycl                Build SYCL for Intel GPU via oneAPI DPC++"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make clean               Remove build outputs"
@@ -112,6 +116,13 @@ strix-halo:
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
 rocm: strix-halo
+
+sycl:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_sycl.o" \
+		CFLAGS="$(CFLAGS) -DDS4_SYCL_BUILD" \
+		DS4_LINK="$(DPCPP) $(SYCL_CFLAGS)" \
+		DS4_LINK_LIBS="$(SYCL_LDLIBS)"
 
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -213,6 +224,9 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
+
+ds4_sycl.o: ds4_sycl.cpp ds4_gpu.h
+	$(DPCPP) $(SYCL_CFLAGS) -c -o $@ ds4_sycl.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
