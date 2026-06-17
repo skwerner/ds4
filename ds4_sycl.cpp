@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
 
 #define DS4_SYCL_UNUSED __attribute__((unused))
 #define DS4_SYCL_MAX_STREAMS 4
@@ -505,7 +506,6 @@ static int sycl_stream_expert_cache_load_slot(
                         (const char *)model_map + up_src, gate_expert_bytes);
         g_queue->memcpy(cache->down_ptr + down_dst,
                         (const char *)model_map + down_src, down_expert_bytes);
-        g_queue->wait_and_throw();
     } catch (...) { return 0; }
     sycl_stream_expert_cache_slot &entry = cache->slots[slot];
     entry.valid = 1;
@@ -564,7 +564,6 @@ static int sycl_stream_expert_cache_copy_to_compact(
                         cache->up_ptr + src_gate, cache->gate_expert_bytes);
         g_queue->memcpy(compact_down + dst_down,
                         cache->down_ptr + src_down, cache->down_expert_bytes);
-        g_queue->wait_and_throw();
         return 1;
     } catch (...) { return 0; }
 }
@@ -680,7 +679,6 @@ static int sycl_model_copy_to_device(
     if (!dst || !model_map || bytes == 0) return 0;
     try {
         g_queue->memcpy(dst, (const char *)model_map + offset, bytes);
-        g_queue->wait_and_throw();
         return 1;
     } catch (...) { return 0; }
 }
@@ -809,7 +807,6 @@ static int sycl_stream_selected_cache_begin_compact_load(
     try {
         g_queue->memcpy(g_stream_selected_cache.slot_selected_ptr, slot_ids,
                         (size_t)slot_count * sizeof(int32_t));
-        g_queue->wait_and_throw();
     } catch (...) {
         sycl_stream_selected_cache_invalidate();
         return strict_failure ? 0 : 1;
@@ -877,6 +874,21 @@ static void sycl_convert_f32_f16(sycl::queue &q, uint64_t count, const float *sr
         dst[i] = sycl::half(src[i]);
     });
 }
+
+/* Profiling: enabled by DS4_SYCL_PROFILE=1 env var */
+struct sycl_profile_timer {
+    std::chrono::steady_clock::time_point t0;
+    const char *name;
+    sycl_profile_timer(const char *name_) : name(name_) { t0 = std::chrono::steady_clock::now(); }
+    ~sycl_profile_timer() {
+        static int enabled = -1;
+        if (enabled < 0) enabled = getenv("DS4_SYCL_PROFILE") != nullptr;
+        if (!enabled) return;
+        double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "ds4: SYCL prof %s %.3f ms\n", name, ms);
+    }
+};
 
 /* =========================================================================
  * ds4_gpu_init / cleanup
@@ -1418,7 +1430,6 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
             uint32_t e = i % n_embd;
             ((float *)out_hc->ptr)[i] = (float)((const sycl::half *)wptr)[(uint64_t)token * n_embd + e];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL embed_token_hc failed: %s\n", e.what());
@@ -1450,7 +1461,6 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
             if (tok >= n_vocab) tok = 0;
             ((float *)out_hc->ptr)[gid] = (float)((const sycl::half *)wptr)[(uint64_t)tok * n_embd + d];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL embed_tokens_hc failed: %s\n", e.what());
@@ -1498,7 +1508,7 @@ static void indexer_scores_launch(
             }
             s_data[(uint64_t)t * n_comp + c] = total * scale;
         });
-    }).wait();
+    });
 }
 
 extern "C" int ds4_gpu_indexer_score_one_tensor(
@@ -1578,7 +1588,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 }
             }
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -1622,7 +1632,7 @@ extern "C" int ds4_gpu_argmax_tensor(
             }
             if (tid == 0) *idx_data = sm_idx[0];
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -1647,7 +1657,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
             }
             m_data[(uint64_t)t * n_comp + c] = v;
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -1732,16 +1742,15 @@ static void sycl_matmul_q8_0_preq_sg(sycl::queue &q,
                                       const float *xscale,
                                       uint64_t out_dim,
                                       uint64_t blocks_per_row) {
-    sycl::range<1> global(16 * ((out_dim + 15) / 16));
+    /* Work-group of 16: all lanes share the same output row,
+       distributing the block loop, then sub-group reduce. */
+    sycl::range<1> global(out_dim * 16);
     sycl::range<1> local(16);
     q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
-        uint64_t row_base = item.get_group(0) * 16;
-        uint64_t sg_id = item.get_sub_group().get_group_id();
-        uint64_t row = row_base + sg_id;
+        uint64_t row = (uint64_t)item.get_global_id(0) / 16;
+        uint32_t lane = (uint32_t)item.get_local_id(0);
         if (row >= out_dim) return;
-
         auto sg = item.get_sub_group();
-        uint32_t lane = sg.get_local_id();
         float acc = 0.0f;
         for (uint64_t b = lane; b < blocks_per_row; b += 16) {
             const uint8_t *block = w8 + (row * blocks_per_row + b) * 34;
@@ -1770,17 +1779,16 @@ static void sycl_matmul_q8_0_preq_batch_sg(sycl::queue &q,
                                              uint64_t out_dim,
                                              uint64_t blocks_per_row,
                                              uint64_t n_tok) {
-    sycl::range<2> global(16 * ((out_dim + 15) / 16), n_tok);
-    sycl::range<2> local(16, 1);
+    /* Work-group (1,16): 16 lanes process SAME (row,tok), 
+       distributing the block loop, then sub-group reduce. */
+    sycl::range<2> global(out_dim, n_tok * 16);
+    sycl::range<2> local(1, 16);
     q.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        uint64_t row_base = (uint64_t)item.get_group(0) * 8;
-        uint64_t tok = (uint64_t)item.get_group(1);
-        uint64_t sg_id = item.get_sub_group().get_group_id();
-        uint64_t row = row_base + sg_id;
-        if (row >= out_dim) return;
-
+        uint64_t row = (uint64_t)item.get_global_id(0);
+        uint64_t tok = (uint64_t)item.get_global_id(1) / 16;
+        if (row >= out_dim || tok >= n_tok) return;
+        uint32_t lane = (uint32_t)item.get_local_id(1);
         auto sg = item.get_sub_group();
-        uint32_t lane = sg.get_local_id();
         const int8_t *xqr = xq + tok * blocks_per_row * 32;
         const float *xsr = xscale + tok * blocks_per_row;
         float acc = 0.0f;
@@ -1815,8 +1823,7 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(
     if (!wptr) return 0;
     const uint8_t *w8 = (const uint8_t *)wptr;
     try {
-        if (n_tok > 1 && blocks_per_row <= 32) {
-            /* Pre-quantise + sub-group batch kernel for small block count. */
+        if (n_tok > 1) {
             uint64_t xq_bytes = n_tok * blocks_per_row * 32;
             int8_t *xq = (int8_t *)sycl::malloc_device(xq_bytes, *g_queue);
             float *xscale = (float *)sycl::malloc_device(n_tok * blocks_per_row * sizeof(float), *g_queue);
@@ -1828,38 +1835,8 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(
                                in_dim, blocks_per_row, n_tok);
             sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out->ptr, w8,
                                             xq, xscale, out_dim, blocks_per_row, n_tok);
-            g_queue->wait_and_throw();
             sycl::free(xq, *g_queue);
             sycl::free(xscale, *g_queue);
-        } else if (n_tok > 1) {
-            /* Many blocks: dequant weights to fp32 then oneMKL gemm. */
-            uint64_t wf32_count = out_dim * in_dim;
-            float *wf32 = (float *)sycl::malloc_device(wf32_count * sizeof(float), *g_queue);
-            if (!wf32) return 0;
-            g_queue->parallel_for(sycl::range<1>(out_dim * blocks_per_row), [=](sycl::id<1> idx) {
-                uint64_t bid = (uint64_t)idx;
-                uint64_t brow = bid / blocks_per_row;
-                uint64_t bcol = bid % blocks_per_row;
-                const uint8_t *block = w8 + (brow * blocks_per_row + bcol) * 34;
-                uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
-                float d = sycl_half_to_float(d_bits);
-                const int8_t *qs = (const int8_t *)(block + 2);
-                float *row_out = wf32 + brow * in_dim + bcol * 32;
-                for (int i = 0; i < 32; i++) row_out[i] = d * (float)qs[i];
-            });
-            g_queue->wait_and_throw();
-            const float alpha = 1.0f, beta = 0.0f;
-            oneapi::mkl::blas::gemm(*g_queue,
-                                    oneapi::mkl::transpose::trans,
-                                    oneapi::mkl::transpose::nontrans,
-                                    (int64_t)out_dim, (int64_t)n_tok, (int64_t)in_dim,
-                                    alpha,
-                                    wf32, (int64_t)in_dim,
-                                    (const float *)x->ptr, (int64_t)in_dim,
-                                    beta,
-                                    (float *)out->ptr, (int64_t)out_dim);
-            g_queue->wait_and_throw();
-            sycl::free(wf32, *g_queue);
         } else {
             /* Single token: pre-quantise + sub-group kernel. */
             int8_t *xq = (int8_t *)sycl::malloc_device(blocks_per_row * 32, *g_queue);
@@ -1872,7 +1849,6 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(
                                in_dim, blocks_per_row, 1);
             sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out->ptr, w8,
                                       xq, xscale, out_dim, blocks_per_row);
-            g_queue->wait_and_throw();
             sycl::free(xq, *g_queue);
             sycl::free(xscale, *g_queue);
         }
@@ -1890,10 +1866,38 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) return 0;
-    return ds4_gpu_matmul_q8_0_tensor(out0, model_map, model_size, weight0_offset,
-                                       in_dim, out0_dim, x, n_tok) &&
-           ds4_gpu_matmul_q8_0_tensor(out1, model_map, model_size, weight1_offset,
-                                       in_dim, out1_dim, x, n_tok);
+    uint64_t blocks_per_row = (in_dim + 31) / 32;
+    if (weight0_offset > model_size || out0_dim > UINT64_MAX / (blocks_per_row * 34)) return 0;
+    if (weight1_offset > model_size || out1_dim > UINT64_MAX / (blocks_per_row * 34)) return 0;
+    uint64_t w0_bytes = out0_dim * blocks_per_row * 34;
+    uint64_t w1_bytes = out1_dim * blocks_per_row * 34;
+    if (w0_bytes > model_size - weight0_offset || w1_bytes > model_size - weight1_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    if (out0->bytes < n_tok * out0_dim * sizeof(float)) return 0;
+    if (out1->bytes < n_tok * out1_dim * sizeof(float)) return 0;
+    const uint8_t *w0 = (const uint8_t *)sycl_model_range_ptr(model_map, weight0_offset, w0_bytes, "q8_0");
+    const uint8_t *w1 = (const uint8_t *)sycl_model_range_ptr(model_map, weight1_offset, w1_bytes, "q8_0");
+    if (!w0 || !w1) return 0;
+    try {
+        uint64_t xq_bytes = n_tok * blocks_per_row * 32;
+        int8_t *xq = (int8_t *)sycl::malloc_device(xq_bytes, *g_queue);
+        float *xscale = (float *)sycl::malloc_device(n_tok * blocks_per_row * sizeof(float), *g_queue);
+        if (!xq || !xscale) { sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue); return 0; }
+        sycl_quantize_q8_0(*g_queue, xq, xscale, (const float *)x->ptr, in_dim, blocks_per_row, n_tok);
+        if (n_tok > 1) {
+            sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out0->ptr, w0, xq, xscale, out0_dim, blocks_per_row, n_tok);
+            sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out1->ptr, w1, xq, xscale, out1_dim, blocks_per_row, n_tok);
+        } else {
+            sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out0->ptr, w0, xq, xscale, out0_dim, blocks_per_row);
+            sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out1->ptr, w1, xq, xscale, out1_dim, blocks_per_row);
+        }
+        sycl::free(xq, *g_queue);
+        sycl::free(xscale, *g_queue);
+        return 1;
+    } catch (sycl::exception &e) {
+        fprintf(stderr, "ds4: SYCL matmul_q8_0_pair failed: %s\n", e.what());
+        return 0;
+    }
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -1950,7 +1954,6 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                                     xh, (int64_t)in_dim,
                                     beta,
                                     (float *)out->ptr, (int64_t)out_dim);
-            g_queue->wait_and_throw();
             sycl::free(xh, *g_queue);
         } else {
             g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
@@ -1960,7 +1963,6 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                     sum += (float)w[o * in_dim + i] * ((const float *)x->ptr)[i];
                 ((float *)out->ptr)[o] = sum;
             });
-            g_queue->wait_and_throw();
         }
         return 1;
     } catch (sycl::exception &e) {
@@ -2018,7 +2020,6 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
                 ((float *)out->ptr)[o] = sum;
             });
         }
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL matmul_f32 failed: %s\n", e.what());
@@ -2037,7 +2038,6 @@ extern "C" int ds4_gpu_repeat_hc_tensor(
         g_queue->parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             ((float *)out->ptr)[i] = ((const float *)row->ptr)[i % n_embd];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL repeat_hc failed: %s\n", e.what());
@@ -2062,7 +2062,6 @@ extern "C" int ds4_gpu_rms_norm_plain_tensor(
             float *orow = (float *)out->ptr;
             for (uint32_t i = 0; i < n; i++) orow[i] = xr[i] * scale;
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL rms_norm_plain failed: %s\n", e.what());
@@ -2085,7 +2084,6 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(
             float scale = sycl::rsqrt(sum / (float)n + eps);
             for (uint32_t i = 0; i < n; i++) orow[i] = xr[i] * scale;
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL rms_norm_plain_rows failed: %s\n", e.what());
@@ -2113,7 +2111,6 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(
             float *orow = (float *)out->ptr;
             for (uint32_t i = 0; i < n; i++) orow[i] = xr[i] * scale * w[i];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL rms_norm_weight failed: %s\n", e.what());
@@ -2142,7 +2139,6 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
             float scale = sycl::rsqrt(sum / (float)n + eps);
             for (uint32_t i = 0; i < n; i++) orow[i] = xr[i] * scale * w[i];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL rms_norm_weight_rows failed: %s\n", e.what());
@@ -2189,7 +2185,6 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(
             float scale = sycl::rsqrt(sum / (float)head_dim + eps);
             for (uint32_t i = 0; i < head_dim; i++) xr[i] *= scale;
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL head_rms_norm failed: %s\n", e.what());
@@ -2246,7 +2241,6 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
                 tail[i + 1] = x0 * s + x1 * c;
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL head_rms_norm_rope_tail failed: %s\n", e.what());
@@ -2299,7 +2293,6 @@ extern "C" int ds4_gpu_rope_tail_tensor(
             tail[i] = x0 * c - x1 * s;
             tail[i + 1] = x0 * s + x1 * c;
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL rope_tail failed: %s\n", e.what());
@@ -2326,7 +2319,6 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     if (q_half->bytes < n_elems * sizeof(sycl::half)) return 0;
     try {
         sycl_convert_f32_f16(*g_queue, n_elems, (const float *)out->ptr, (sycl::half *)q_half->ptr);
-        g_queue->wait_and_throw();
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attn_q_b_f16_head_rms_rope_tail failed: %s\n", e.what());
         return 0;
@@ -2396,7 +2388,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
                 item.barrier(sycl::access::fence_space::local_space);
             }
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -2425,7 +2417,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(
             float v = kv_data[(uint64_t)t * head_dim + d];
             raw_data[(uint64_t)dest_row * head_dim + d] = (float)(sycl::half)v;
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -2477,7 +2469,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
             ssc[(uint64_t)dst_row * width + j] =
                 sc_data[(uint64_t)t * width + j] + (apt == 1u ? (float)((const sycl::half *)ape)[(uint64_t)pos_mod * width + j] : ((const float *)ape)[(uint64_t)pos_mod * width + j]);
         });
-    }).wait();
+    });
     return 1;
 }
 
@@ -2554,7 +2546,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             }
             comp_data[(uint64_t)comp_row * head_dim + d] = den != 0.0f ? acc / den : 0.0f;
         });
-    }).wait();
+    });
     ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
             comp_cache,
             (uint64_t)comp_row * head_dim * sizeof(float),
@@ -2579,7 +2571,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                 skv[half + i] = v;
                 ssc[half + i] = s;
             });
-        }).wait();
+        });
     }
     return 1;
 }
@@ -2606,7 +2598,7 @@ static inline void compressor_set_rows_launch(
             state_score[(uint64_t)dst * width + j] =
                 sc[(uint64_t)src * width + j] + (apt == 1u ? (float)((const sycl::half *)ape)[(uint64_t)phase * width + j] : ((const float *)ape)[(uint64_t)phase * width + j]);
         });
-    }).wait();
+    });
 }
 
 /* ---- Compressor prefill pool ---- */
@@ -2671,7 +2663,7 @@ static inline void compressor_prefill_pool_launch(
             }
             comp[(uint64_t)c * head_dim + d] = den != 0.0f ? acc / den : 0.0f;
         });
-    }).wait();
+    });
 }
 
 /* ---- Compressor prefill ---- */
@@ -2718,7 +2710,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     qptr->memset(skv, 0, state_n * sizeof(float));
     qptr->submit([&](sycl::handler &h) {
         h.parallel_for(sycl::range<1>(state_n), [=](sycl::id<1> i) { ssc[(uint64_t)i] = -INFINITY; });
-    }).wait();
+    });
     const float *kv_data = (const float *)kv->ptr;
     const float *sc_data = (const float *)sc->ptr;
     if (ratio == 4u) {
@@ -2814,7 +2806,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     qptr2->memset(skv, 0, state_n * sizeof(float));
     qptr2->submit([&](sycl::handler &h) {
         h.parallel_for(sycl::range<1>(state_n), [=](sycl::id<1> i) { ssc[(uint64_t)i] = -INFINITY; });
-    }).wait();
+    });
     compressor_set_rows_launch(skv, ssc, kv_data, sc_data, ape, ape_type,
                                width, ratio, pos0, n_tokens - ratio, 0, ratio);
     return 1;
@@ -2849,7 +2841,7 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
     qptr->memset(skv, 0, state_n * sizeof(float));
     qptr->submit([&](sycl::handler &h) {
         h.parallel_for(sycl::range<1>(state_n), [=](sycl::id<1> i) { ssc[(uint64_t)i] = -INFINITY; });
-    }).wait();
+    });
     compressor_set_rows_launch(skv, ssc,
                                (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
                                ape, ape_type, width, ratio, pos0, 0, 0, ratio);
@@ -2951,7 +2943,6 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                 for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_decode_heads failed: %s\n", e.what());
@@ -3016,7 +3007,6 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                 for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_prefill_raw_heads failed: %s\n", e.what());
@@ -3105,7 +3095,6 @@ extern "C" int ds4_gpu_attention_decode_raw_batch_heads_tensor(
                 for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_decode_raw_batch_heads failed: %s\n", e.what());
@@ -3240,7 +3229,6 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                 }
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_decode_mixed_batch_heads failed: %s\n", e.what());
@@ -3368,7 +3356,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 }
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_indexed_mixed_batch_heads failed: %s\n", e.what());
@@ -3468,7 +3455,6 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                 for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_prefill_static_mixed_heads failed: %s\n", e.what());
@@ -3583,7 +3569,6 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                 }
             }
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL attention_prefill_masked_mixed_heads failed: %s\n", e.what());
@@ -3653,7 +3638,6 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 });
             });
             /* Batch Q8_0 matmul: all tokens at once for this group */
-            g_queue->wait_and_throw();
             const char *wa_ptr = sycl_model_range_ptr(model_map, group_offset,
                 rank * blocks_a * 34, "attn_out_a");
             if (!wa_ptr) { sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue); return 0; }
@@ -3691,7 +3675,6 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     }
                 });
             });
-            g_queue->wait_and_throw();
         } catch (sycl::exception &e) {
             fprintf(stderr, "ds4: SYCL attention_output_q8_batch project A failed: %s\n", e.what());
             sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
@@ -3768,7 +3751,6 @@ extern "C" int ds4_gpu_swiglu_tensor(
             float s = g / (1.0f + sycl::exp(-g));
             ((float *)out->ptr)[i] = s * u * weight;
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL swiglu failed: %s\n", e.what());
@@ -3788,7 +3770,6 @@ extern "C" int ds4_gpu_add_tensor(
             uint32_t i = (uint32_t)idx;
             ((float *)out->ptr)[i] = ((const float *)a->ptr)[i] + ((const float *)b->ptr)[i];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL add failed: %s\n", e.what());
@@ -3812,7 +3793,6 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
             float coeff = scale * sum;
             for (uint32_t i = 0; i < width; i++) xr[i] -= coeff * dir[i];
         });
-        g_queue->wait_and_throw();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL directional_steering_project failed: %s\n", e.what());
@@ -3991,15 +3971,19 @@ static int sycl_routed_moe_launch(
     const uint32_t qk_k = CUDA_QK_K;
 
     /* Kernel 1: gate / up / mid for every (row, pair).
-       Grid: (expert_mid_dim, pair_count), 1 work-item per element. */
+       Work-group (1,16) — 16 lanes parallelize the inner 16-element loop
+       via sub-group reduction. */
     if (q4k_path) {
-        /* Q4_K path: gate_type=12, down_type=12.
-           For simplicity, dequantize each Q4_K block to f32 inline. */
         if (gate_row_bytes < sizeof(uint16_t) + 12 + 128) return 0;
         g_queue->submit([&](sycl::handler &h) {
-            h.parallel_for(sycl::range<2>(expert_mid_dim, pair_count), [=](sycl::id<2> idx) {
-                uint32_t row  = idx[0];
-                uint32_t pair = idx[1];
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(expert_mid_dim, pair_count * 16),
+                sycl::range<2>(1, 16)), [=](sycl::nd_item<2> item) {
+                uint32_t row  = item.get_global_id(0);
+                uint32_t pair = item.get_global_id(1) / 16;
+                uint32_t lane = item.get_sub_group().get_local_id();
+                if (row >= expert_mid_dim || pair >= pair_count) return;
+                auto sg = item.get_sub_group();
                 uint32_t tok  = pair / n_expert;
                 uint32_t slot = pair - tok * n_expert;
                 int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
@@ -4008,7 +3992,6 @@ static int sycl_routed_moe_launch(
                 const uint8_t *gr = (const uint8_t *)(gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
                 const uint8_t *ur = (const uint8_t *)(up_w   + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
                 const float *xr = x_ptr + (uint64_t)tok * expert_in_dim;
-                /* Dequantize Q4_K blocks and dot product */
                 uint32_t nb = expert_in_dim / qk_k;
                 float gate = 0.0f, up = 0.0f;
                 for (uint32_t b = 0; b < nb; b++) {
@@ -4027,21 +4010,23 @@ static int sycl_routed_moe_launch(
                         uint32_t chunk = il / 8u;
                         uint32_t pair_il = il & 1u;
                         uint32_t shift = ((il / 2u) & 3u) * 2u;
-                        float gdl = gd * (float)((gsc[il] >> (shift & 3u)) & 3u); // Q4_K uses nibbles
-                        float gml = gdmin * (float)((gsc[il] >> (4u + (shift & 3u))) & 3u); 
+                        float gdl = gd * (float)((gsc[il] >> (shift & 3u)) & 3u);
+                        float gml = gdmin * (float)((gsc[il] >> (4u + (shift & 3u))) & 3u);
                         float udl = ud * (float)((usc[il] >> (shift & 3u)) & 3u);
                         float uml = udmin * (float)((usc[il] >> (4u + (shift & 3u))) & 3u);
                         const uint8_t *gqblk = gqs + chunk * 64u + pair_il * 32u;
                         const uint8_t *uqblk = uqs + chunk * 64u + pair_il * 32u;
                         const float *xblk_off = xblk + chunk * 128u + ((il % 8u) / 2u) * 32u + pair_il * 16u;
-                        for (uint32_t i = 0; i < 16; i++) {
-                            float gw = gdl * (float)((gqblk[i] >> (shift & 3u)) & 0x0fu) - gml;
-                            float uw = udl * (float)((uqblk[i] >> (shift & 3u)) & 0x0fu) - uml;
-                            gate += gw * xblk_off[i];
-                            up   += uw * xblk_off[i];
+                        if (lane < 16) {
+                            float gw = gdl * (float)((gqblk[lane] >> (shift & 3u)) & 0x0fu) - gml;
+                            float uw = udl * (float)((uqblk[lane] >> (shift & 3u)) & 0x0fu) - uml;
+                            gate += gw * xblk_off[lane];
+                            up   += uw * xblk_off[lane];
                         }
                     }
                 }
+                gate = sycl::reduce_over_group(sg, gate, sycl::plus<float>());
+                up   = sycl::reduce_over_group(sg, up,   sycl::plus<float>());
                 float weight = wgt_ptr[(uint64_t)tok * n_expert + slot];
                 float gate_act = (gate / (1.0f + expf(-gate)));
                 if (clamp > 1.0e-6f) {
@@ -4049,12 +4034,14 @@ static int sycl_routed_moe_launch(
                     if (up > clamp) up = clamp;
                     if (up < -clamp) up = -clamp;
                 }
-                uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-                gate_out[off] = gate;
-                up_out[off]   = up;
-                mid_out[off]  = gate_act * up * weight;
+                if (lane == 0) {
+                    uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+                    gate_out[off] = gate;
+                    up_out[off]   = up;
+                    mid_out[off]  = gate_act * up * weight;
+                }
             });
-        }).wait();
+        });
     } else {
         /* IQ2_XXS gate + Q2_K down path (gate_type=16, down_type=10) */
         g_queue->submit([&](sycl::handler &h) {
@@ -4084,15 +4071,20 @@ static int sycl_routed_moe_launch(
                 up_out[off]   = up;
                 mid_out[off]  = gate_act * up * weight;
             });
-        }).wait();
+        });
     }
 
     /* Kernel 2: down projection for every (row, pair).
-       Grid: (out_dim, pair_count), 1 work-item per element. */
+       Work-group (1,16) — sub-group parallelizes inner 16-element loop. */
     g_queue->submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::range<2>(out_dim, pair_count), [=](sycl::id<2> idx) {
-            uint32_t row  = idx[0];
-            uint32_t pair = idx[1];
+        h.parallel_for(sycl::nd_range<2>(
+            sycl::range<2>(out_dim, pair_count * 16),
+            sycl::range<2>(1, 16)), [=](sycl::nd_item<2> item) {
+            uint32_t row  = item.get_global_id(0);
+            uint32_t pair = item.get_global_id(1) / 16;
+            uint32_t lane = item.get_sub_group().get_local_id();
+            if (row >= out_dim || pair >= pair_count) return;
+            auto sg = item.get_sub_group();
             uint32_t tok  = pair / n_expert;
             uint32_t slot = pair - tok * n_expert;
             int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
@@ -4115,15 +4107,17 @@ static int sycl_routed_moe_launch(
                     float ml = dmin * (float)(sc >> 4);
                     const uint8_t *q = xb->qs + 32u * chunk + 16u * pair_il;
                     const float *xf = xr + (uint64_t)b * qk_k + chunk * 128u + ((il % 8u) / 2u) * 32u + pair_il * 16u;
-                    for (uint32_t i = 0; i < 16; i++) {
-                        float w = dl * (float)((q[i] >> shift) & 3u) - ml;
-                        acc += w * xf[i];
+                    if (lane < 16) {
+                        float w = dl * (float)((q[lane] >> shift) & 3u) - ml;
+                        acc += w * xf[lane];
                     }
                 }
             }
-            down_out[(uint64_t)pair * out_dim + row] = acc;
+            acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0)
+                down_out[(uint64_t)pair * out_dim + row] = acc;
         });
-    }).wait();
+    });
 
     /* Kernel 3: sum across experts */
     uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -4136,7 +4130,7 @@ static int sycl_routed_moe_launch(
                 acc += down_out[((uint64_t)tok * n_expert + e) * out_dim + row];
             out_ptr[gid] = acc;
         });
-    }).wait();
+    });
 
     return 1;
 }
