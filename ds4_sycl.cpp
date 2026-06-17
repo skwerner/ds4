@@ -1732,11 +1732,10 @@ static void sycl_matmul_q8_0_preq_sg(sycl::queue &q,
                                       const float *xscale,
                                       uint64_t out_dim,
                                       uint64_t blocks_per_row) {
-    sycl::range<1> global(8 * ((out_dim + 7) / 8) * 16);
-    sycl::range<1> local(8 * 16);
+    sycl::range<1> global(16 * ((out_dim + 15) / 16));
+    sycl::range<1> local(16);
     q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
-        uint64_t group_id = item.get_group(0);
-        uint64_t row_base = group_id * 8;
+        uint64_t row_base = item.get_group(0) * 16;
         uint64_t sg_id = item.get_sub_group().get_group_id();
         uint64_t row = row_base + sg_id;
         if (row >= out_dim) return;
@@ -1761,7 +1760,8 @@ static void sycl_matmul_q8_0_preq_sg(sycl::queue &q,
 }
 
 /* Batched pre-quantised Q8_0 matmul with sub-group reduction.
-   Work-group: 8 rows per group (sg0..sg7), token dimension via blockIdx.y. */
+   Work-group: 16 rows per group (one sub-group per row), token dim via blockIdx.y.
+   Work-group size 16*1=16 matches sub-group size 16 so all lanes are active. */
 static void sycl_matmul_q8_0_preq_batch_sg(sycl::queue &q,
                                              float *out,
                                              const uint8_t *w8,
@@ -1770,8 +1770,8 @@ static void sycl_matmul_q8_0_preq_batch_sg(sycl::queue &q,
                                              uint64_t out_dim,
                                              uint64_t blocks_per_row,
                                              uint64_t n_tok) {
-    sycl::range<2> global(8 * ((out_dim + 7) / 8), n_tok);
-    sycl::range<2> local(8, 1);
+    sycl::range<2> global(16 * ((out_dim + 15) / 16), n_tok);
+    sycl::range<2> local(16, 1);
     q.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
         uint64_t row_base = (uint64_t)item.get_group(0) * 8;
         uint64_t tok = (uint64_t)item.get_group(1);
@@ -1902,7 +1902,6 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         const ds4_gpu_tensor *x, uint64_t n_tok) {
     (void)out_h; (void)model_map; (void)model_size; (void)weight_offset;
     (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    fprintf(stderr, "ds4: SYCL matmul_q8_0_f16_out not implemented\n");
     return 0;
 }
 
@@ -3614,24 +3613,94 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) return 0;
-    /* Project A: each group does heads[g] @ out_a[g]^T -> low[g]
-       heads  layout: [n_tokens][n_groups][group_dim]
-       low    layout: [n_tokens][n_groups][rank]
+
+    /* Project A (batched): launch one Q8_0 matmul per group for all tokens.
+       heads  layout: [n_tokens][n_groups][group_dim] — strided per group
+       low    layout: [n_tokens][n_groups][rank] — strided per group
        out_a  layout: [n_groups][rank][group_dim] (Q8) */
     for (uint32_t g = 0; g < n_groups; g++) {
         uint64_t group_offset = out_a_offset + (uint64_t)g * rank * blocks_a * 34;
-        float *low_group = (float *)low->ptr + (uint64_t)g * rank;
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            /* Per-token, per-group Q8 matmul (single token, group_dim -> rank) */
-            ds4_gpu_tensor head_view = { (char *)heads->ptr + ((uint64_t)t * n_groups + g) * group_dim * sizeof(float),
-                                         group_dim * sizeof(float), 0 };
-            ds4_gpu_tensor low_row_view = { low_group + (uint64_t)t * low_dim,
-                                            rank * sizeof(float), 0 };
-            if (!ds4_gpu_matmul_q8_0_tensor(&low_row_view, model_map, model_size,
-                                             group_offset, group_dim, rank,
-                                             &head_view, 1)) return 0;
+        /* Build views: heads[:,g,:] is non-contiguous (strided by n_groups).
+           Pre-quantize into a contiguous temp buffer for batch matmul. */
+        uint64_t xq_bytes = n_tokens * blocks_a * 32;
+        uint64_t xs_bytes = n_tokens * blocks_a * sizeof(float);
+        int8_t *xq = (int8_t *)sycl::malloc_device(xq_bytes, *g_queue);
+        float *xscale = (float *)sycl::malloc_device(xs_bytes, *g_queue);
+        if (!xq || !xscale) {
+            sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
+            return 0;
         }
+        /* Quantize: strided read from heads[:,g,:] into contiguous xq/xscale */
+        try {
+            g_queue->submit([&](sycl::handler &h) {
+                h.parallel_for(sycl::range<2>(blocks_a, n_tokens), [=](sycl::id<2> idx) {
+                    uint32_t b = idx[0], t = idx[1];
+                    const float *row = (const float *)heads->ptr +
+                        ((uint64_t)t * n_groups + g) * group_dim + (uint64_t)b * 32;
+                    int8_t *xq_row = xq + ((uint64_t)t * blocks_a + b) * 32;
+                    float maxv = 0.0f;
+                    for (int i = 0; i < 32; i++) {
+                        float v = row[i];
+                        if (v > maxv) maxv = v;
+                        if (-v > maxv) maxv = -v;
+                    }
+                    float d = maxv / 127.0f;
+                    if (d == 0.0f) d = 1.0f;
+                    xscale[t * blocks_a + b] = d;
+                    for (int i = 0; i < 32; i++) {
+                        xq_row[i] = (int8_t)(row[i] / d);
+                    }
+                });
+            });
+            /* Batch Q8_0 matmul: all tokens at once for this group */
+            g_queue->wait_and_throw();
+            const char *wa_ptr = sycl_model_range_ptr(model_map, group_offset,
+                rank * blocks_a * 34, "attn_out_a");
+            if (!wa_ptr) { sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue); return 0; }
+            const uint8_t *w8_const = (const uint8_t *)wa_ptr;
+            g_queue->submit([=](sycl::handler &h) {
+                h.parallel_for(sycl::nd_range<2>(
+                    sycl::range<2>(16 * ((rank + 15) / 16), n_tokens),
+                    sycl::range<2>(16, 1)), [=](sycl::nd_item<2> item) {
+                    uint64_t row_base = (uint64_t)item.get_group(0) * 16;
+                    uint64_t tok = (uint64_t)item.get_group(1);
+                    uint64_t sg_id = item.get_sub_group().get_group_id();
+                    uint64_t row = row_base + sg_id;
+                    if (row >= rank) return;
+
+                    auto sg = item.get_sub_group();
+                    uint32_t lane = sg.get_local_id();
+                    const int8_t *xqr = xq + tok * blocks_a * 32;
+                    const float *xsr = xscale + tok * blocks_a;
+                    float acc = 0.0f;
+                    for (uint64_t b = lane; b < blocks_a; b += 16) {
+                        const uint8_t *block = w8_const + (row * blocks_a + b) * 34;
+                        uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+                        float wscale = sycl_half_to_float(d_bits);
+                        const int8_t *wq = (const int8_t *)(block + 2);
+                        const int8_t *xqb = xqr + b * 32;
+                        int dot = 0;
+                        for (int i = 0; i < 32; i++) dot += (int)wq[i] * (int)xqb[i];
+                        acc += wscale * xsr[b] * (float)dot;
+                    }
+                    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                    if (lane == 0) {
+                        float *low_out = (float *)low->ptr +
+                            ((uint64_t)tok * n_groups + g) * rank + row;
+                        *low_out = acc;
+                    }
+                });
+            });
+            g_queue->wait_and_throw();
+        } catch (sycl::exception &e) {
+            fprintf(stderr, "ds4: SYCL attention_output_q8_batch project A failed: %s\n", e.what());
+            sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
+            return 0;
+        }
+        sycl::free(xq, *g_queue);
+        sycl::free(xscale, *g_queue);
     }
+
     /* Project B: low @ out_b^T -> out (single Q8 matmul) */
     return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
                                        out_b_offset, low_dim, out_dim,
@@ -3648,8 +3717,6 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     (void)out_h; (void)low; (void)model_map; (void)model_size;
     (void)out_a_offset; (void)out_b_offset; (void)group_dim;
     (void)rank; (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    /* Stub in CUDA backend too — not used by current models */
-    fprintf(stderr, "ds4: SYCL attention_output_q8_batch_f16 not implemented\n");
     return 0;
 }
 
