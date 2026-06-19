@@ -425,10 +425,12 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
+    fprintf(stderr, "ds4: DEBUG about to ds4_session_create\n");
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
+    fprintf(stderr, "ds4: DEBUG ds4_session_create done\n");
     if (cli_wait_distributed_route(cfg, session) != 0) {
         ds4_session_free(session);
         return 1;
@@ -456,7 +458,9 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
                                      progress.use_color ? &progress : NULL);
     cli_dist_busy_set(cfg, true);
+    fprintf(stderr, "ds4: DEBUG about to ds4_session_sync\n");
     int sync_rc = ds4_session_sync(session, prompt, err, sizeof(err));
+    fprintf(stderr, "ds4: DEBUG ds4_session_sync done rc=%d\n", sync_rc);
     cli_dist_busy_set(cfg, false);
     if (sync_rc != 0) {
         ds4_session_set_progress(session, NULL, NULL);

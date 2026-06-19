@@ -1973,6 +1973,11 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
+#ifdef DS4_SYCL_BUILD
+    extern void ds4_gpu_prepare_model_memory(const void *, uint64_t);
+    ds4_gpu_prepare_model_memory(map, (uint64_t)st.st_size);
+#endif
+
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
@@ -11061,6 +11066,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
+    fprintf(stderr, "ds4: DEBUG start layer state init loop\n");
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
@@ -11116,6 +11122,7 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
+    fprintf(stderr, "ds4: DEBUG layer state init loop done\n");
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
@@ -11178,21 +11185,38 @@ static bool metal_graph_alloc_raw_cap(
     }
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
+    fprintf(stderr, "ds4: DEBUG alloc prefill_tokens\n");
+    g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_cur_hc pc=%lu hc_dim=%lu bytes=%lu\n", (unsigned long)pc, (unsigned long)hc_dim, (unsigned long)(pc * hc_dim * sizeof(float)));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_next_hc\n");
     g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_flat_hc\n");
     g->batch_hc_mix = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_hc_mix\n");
     g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_hc_split\n");
     g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_attn_cur\n");
     g->batch_attn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_attn_norm\n");
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_qr\n");
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_qr_norm\n");
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_q\n");
     g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
+    fprintf(stderr, "ds4: DEBUG alloc batch_q_half\n");
     g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_kv_raw\n");
     g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_kv\n");
     g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_comp_kv\n");
     g->batch_comp_sc = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG alloc batch_comp_sc\n");
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
@@ -11211,6 +11235,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_router_probs = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
     g->batch_router_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
     g->batch_router_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG done with small batch allocs\n");
     g->prefill_seed_router_selected =
         ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
                              DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
@@ -11221,6 +11246,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    fprintf(stderr, "ds4: DEBUG done with routed batch allocs\n");
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -11291,6 +11317,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_routed_gate && g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
+    fprintf(stderr, "ds4: DEBUG metal_graph_alloc_raw_cap ok=%d state_init_ok=%d layer_cache_ok=%d\n", ok, state_init_ok, layer_cache_ok);
     if (!ok) metal_graph_free(g);
     return ok;
 }
@@ -17567,10 +17594,11 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         DS4_METAL_PROFILE_Q_STAGE("q_b");
         if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
-                                                    n_tokens,
-                                                    DS4_N_HEAD,
-                                                    DS4_N_HEAD_DIM,
-                                                    DS4_RMS_EPS) != 0;
+                                                     n_tokens,
+                                                     DS4_N_HEAD,
+                                                     DS4_N_HEAD_DIM,
+                                                     DS4_RMS_EPS) != 0;
+        fprintf(stderr, "ds4: DBG after head_rms_norm ok=%d\n", ok);
         if (ok) {
             metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
                                           (uint64_t)n_tokens * q_dim, il, pos0);
@@ -18811,7 +18839,25 @@ static bool metal_graph_encode_layer_ffn_batch(
             ok = metal_graph_layer_stage_profile_boundary("ffn", (name), il, pos0, n_tokens, &layer_stage_t0); \
         } \
     } while (0)
+#define DS4_PERF_BEGIN(name) do { _tps0_##name = now_sec(); } while (0)
+#define DS4_PERF_END(name) do { _tps_##name += now_sec() - _tps0_##name; } while (0)
+#define DS4_PERF_REPORT() do { \
+        double _tps_total = 0; \
+        int _tps_n = 0; \
+        static const char *_tps_names[] = { "hc_pre", "norm", "router_gemm", "router_sel", "shared", "routed_moe", "hc_post" }; \
+        double _tps_vals[] = { _tps_hc_pre, _tps_norm, _tps_router_gemm, _tps_router_sel, _tps_shared, _tps_routed_moe, _tps_hc_post }; \
+        fprintf(stderr, "ds4: L%02u FFN profile:", il); \
+        for (int _tps_i = 0; _tps_i < 7; _tps_i++) { \
+            double v = _tps_vals[_tps_i]; \
+            if (v > 0.001) { fprintf(stderr, " %s=%.0f", _tps_names[_tps_i], v*1000); _tps_total += v; _tps_n++; } \
+        } \
+        fprintf(stderr, " total=%.0f\n", _tps_total*1000); \
+    } while (0)
 
+    double _tps_hc_pre = 0, _tps_norm = 0, _tps_router_gemm = 0, _tps_router_sel = 0;
+    double _tps_shared = 0, _tps_routed_moe = 0, _tps_hc_post = 0;
+    double _tps0_hc_pre = now_sec(), _tps0_norm = 0, _tps0_router_gemm = 0, _tps0_router_sel = 0;
+    double _tps0_shared = 0, _tps0_routed_moe = 0, _tps0_hc_post = 0;
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
     ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
@@ -18886,7 +18932,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("hc_ffn_pre", g->batch_ffn_cur,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    DS4_PERF_END(hc_pre);
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
+    DS4_PERF_BEGIN(norm);
     if (ok && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
                                                   g->batch_ffn_cur,
@@ -18901,7 +18949,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_norm", g->batch_ffn_norm,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    DS4_PERF_END(norm);
     DS4_METAL_PROFILE_FFN_STAGE("norm");
+    DS4_PERF_BEGIN(router_gemm);
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
                                              model->map,
                                              model->size,
@@ -18909,8 +18959,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                              DS4_N_EMBD,
                                              DS4_N_EXPERT,
                                              g->batch_ffn_norm,
-                                             n_tokens) != 0;
+                                              n_tokens) != 0;
 
+    DS4_PERF_END(router_gemm);
+    DS4_PERF_BEGIN(router_sel);
     if (ok) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       g->batch_router_probs,
@@ -18939,7 +18991,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->batch_router_weights,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
     }
+    DS4_PERF_END(router_sel);
     DS4_METAL_PROFILE_FFN_STAGE("router");
+    DS4_PERF_BEGIN(shared);
 
     if (ok) {
         ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
@@ -19150,6 +19204,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 #endif
 
+    DS4_PERF_END(shared);
+    DS4_PERF_BEGIN(routed_moe);
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
@@ -19204,6 +19260,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    DS4_PERF_END(routed_moe);
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
@@ -19211,6 +19268,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16
 
+    DS4_PERF_BEGIN(hc_post);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_batch_ffn_out(g) &&
              ds4_gpu_add_tensor(g->batch_ffn_out,
@@ -19255,7 +19313,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
+    DS4_PERF_END(hc_post);
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
+    DS4_PERF_REPORT();
     ds4_gpu_tensor_free(next_hc_view);
     ds4_gpu_tensor_free(ffn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
@@ -19277,7 +19337,13 @@ static bool metal_graph_encode_layer_batch(
         fprintf(stderr, "ds4: gpu layer %u attention batch encode failed\n", il);
     }
     if (ok) {
+        double t_ffn0 = now_sec();
         ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
+        double t_ffn1 = now_sec();
+        double ffn_ms = (t_ffn1 - t_ffn0) * 1000.0;
+        if (ffn_ms > 1000.0) {
+            fprintf(stderr, "ds4: layer %u FFN %.0f ms\n", il, ffn_ms);
+        }
         if (!ok) {
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
         }
@@ -20374,12 +20440,20 @@ static bool metal_graph_prefill_layer_major(
                                                      n_tokens);
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            double t_before = now_sec();
             ok = metal_graph_encode_layer_batch(g,
                                                 model,
                                                 &weights->layer[il],
                                                 il,
                                                 start,
                                                 n_tokens);
+            double t_after = now_sec();
+            double ms = (t_after - t_before) * 1000.0;
+            if (ms > 5000.0) {
+                fprintf(stderr, "ds4: WARNING layer %u encode %.0f ms (>5s!)\n", il, ms);
+            } else {
+                fprintf(stderr, "ds4: layer %u %.0f ms\n", il, ms);
+            }
             if (!ok) {
                 fprintf(stderr, "ds4: gpu whole-prefill layer %u encode failed\n", il);
             }
@@ -22956,8 +23030,10 @@ static int generate_metal_graph_raw_swa(
         return 1;
     }
 
+    fprintf(stderr, "ds4: DEBUG prefill_cap prompt_len=%d prefill_chunk=%u\n", prompt->len, prefill_chunk);
     const uint32_t prefill_cap =
         metal_graph_prefill_cap_for_prompt(prompt->len, prefill_chunk);
+    fprintf(stderr, "ds4: DEBUG prefill_cap=%u\n", prefill_cap);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
     if (prefill_cap < (uint32_t)prompt->len) {
         fprintf(stderr,
@@ -22968,6 +23044,8 @@ static int generate_metal_graph_raw_swa(
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+    fprintf(stderr, "ds4: DEBUG metal_graph_alloc_raw_cap returned ok=%d\n", ok);
+    fflush(stderr);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -25162,6 +25240,8 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    fprintf(stderr, "ds4: DEBUG ds4_engine_generate_argmax enter graph_uses=%d metal_ready=%d\n",
+            ds4_backend_uses_graph(e->backend), e->metal_ready);
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -26084,6 +26164,26 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
+    /* Auto-tune prefill_chunk based on VRAM if not explicitly set by user.
+     * We need room for batch tensors + KV cache (~1.5 GB) + model weights.
+     * Low-VRAM GPUs (e.g. 8 GB Arc A750) need aggressive reduction to avoid
+     * fragmentation: three 1.12 GiB expert weights + 0.18 GiB non-expert per
+     * layer fragment the allocator, requiring extra headroom. */
+    if (e->prefill_chunk == 0 && ds4_gpu_vram_total() > 0) {
+        const uint64_t vram = ds4_gpu_vram_total();
+        uint32_t safe_chunk = 4096;
+        if (vram < (uint64_t)12 * 1024 * 1024 * 1024) safe_chunk = 1024;
+        if (vram < (uint64_t)9 * 1024 * 1024 * 1024) safe_chunk = 512;
+        if (vram < (uint64_t)7 * 1024 * 1024 * 1024) safe_chunk = 256;
+        const uint32_t safe_pc = ds4_prefill_cap_for_prompt(ctx_size, safe_chunk);
+        if (safe_pc < s->prefill_cap) {
+            fprintf(stderr, "ds4: VRAM %.1f GiB < 12 GiB, reducing prefill_chunk "
+                    "from %u to %u\n",
+                    (double)vram / (1024.0*1024.0*1024.0),
+                    s->prefill_cap, safe_pc);
+            s->prefill_cap = safe_pc;
+        }
+    }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -26791,10 +26891,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    fprintf(stderr, "ds4: DEBUG about to metal_graph_reset_prefill_state\n");
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
+    fprintf(stderr, "ds4: DEBUG metal_graph_reset_prefill_state done, prefill_cap=%u prompt->len=%d\n", s->prefill_cap, prompt->len);
     if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
@@ -26819,6 +26921,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
     } else {
         bool cancelled = false;
+        fprintf(stderr, "ds4: DEBUG about to metal_graph_prefill_raw_swa\n");
         ok = metal_graph_prefill_raw_swa(&s->graph, &e->model, &e->weights,
                                          prompt, prompt->len, s->logits, false,
                                          s->display_progress,
