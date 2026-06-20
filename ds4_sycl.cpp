@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <vector>
+#include <thread>
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
@@ -1871,12 +1872,12 @@ static void sycl_quantize_q8_0(sycl::queue &q,
    Each sub-group handles one row (16 lanes split the block loop,
    then sub-group reduce). */
 static void sycl_matmul_q8_0_preq_sg(sycl::queue &q,
-                                      float *out,
-                                      const uint8_t *w8,
-                                      const int8_t *xq,
-                                      const float *xscale,
-                                      uint64_t out_dim,
-                                      uint64_t blocks_per_row) {
+                                     float *out,
+                                     const uint8_t *w8,
+                                     const int8_t *xq,
+                                     const float *xscale,
+                                     uint64_t out_dim,
+                                     uint64_t blocks_per_row) {
     sycl::range<1> global(round_up(out_dim, 8) * 16);
     sycl::range<1> local(128);
     q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
@@ -3716,24 +3717,23 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) return 0;
 
-    /* Project A (batched): launch one Q8_0 matmul per group for all tokens.
-       heads  layout: [n_tokens][n_groups][group_dim] — strided per group
-       low    layout: [n_tokens][n_groups][rank] — strided per group
-       out_a  layout: [n_groups][rank][group_dim] (Q8) */
+    /* Pre-allocate device buffers reused across all groups (avoids per-group
+       sycl::free which implicitly drains the queue). */
+    uint64_t xq_bytes = n_tokens * blocks_a * 32;
+    uint64_t xs_bytes = n_tokens * blocks_a * sizeof(float);
+    int8_t  *xq      = (int8_t  *)sycl::malloc_device(xq_bytes, *g_queue);
+    float   *xscale  = (float   *)sycl::malloc_device(xs_bytes, *g_queue);
+    if (!xq || !xscale) {
+        sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
+        return 0;
+    }
+
     for (uint32_t g = 0; g < n_groups; g++) {
         uint64_t group_offset = out_a_offset + (uint64_t)g * rank * blocks_a * 34;
         /* Build views: heads[:,g,:] is non-contiguous (strided by n_groups).
            Pre-quantize into a contiguous temp buffer for batch matmul. */
-        uint64_t xq_bytes = n_tokens * blocks_a * 32;
-        uint64_t xs_bytes = n_tokens * blocks_a * sizeof(float);
-        int8_t *xq = (int8_t *)sycl::malloc_device(xq_bytes, *g_queue);
-        float *xscale = (float *)sycl::malloc_device(xs_bytes, *g_queue);
-        if (!xq || !xscale) {
-            sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
-            return 0;
-        }
-        /* Quantize: strided read from heads[:,g,:] into contiguous xq/xscale */
         try {
+            /* Quantize: strided read from heads[:,g,:] into contiguous xq/xscale */
             g_queue->submit([&](sycl::handler &h) {
                 h.parallel_for(sycl::range<2>(blocks_a, n_tokens), [=](sycl::id<2> idx) {
                     uint32_t b = idx[0], t = idx[1];
@@ -3781,6 +3781,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                         const int8_t *wq = (const int8_t *)(block + 2);
                         const int8_t *xqb = xqr + b * 32;
                         int dot = 0;
+#pragma unroll
                         for (int i = 0; i < 32; i++) dot += (int)wq[i] * (int)xqb[i];
                         acc += wscale * xsr[b] * (float)dot;
                     }
@@ -3797,9 +3798,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
             return 0;
         }
-        sycl::free(xq, *g_queue);
-        sycl::free(xscale, *g_queue);
     }
+    sycl::free(xq, *g_queue);
+    sycl::free(xscale, *g_queue);
 
     /* Project B: low @ out_b^T -> out (single Q8 matmul) */
     return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
@@ -4108,16 +4109,37 @@ static int sycl_routed_moe_launch(
     }
     if (sel_host != sel_host_stk) free(sel_host);
 
-    /* Copy only the selected experts' weight blocks from mmap to host buffer. */
+    /* Copy only the selected experts' weight blocks from mmap to host buffer.
+     * Parallelized across all available hardware cores — each expert's three
+     * tensors are independent. */
     const char *mmap = (const char *)model_map;
-    for (uint32_t e = 0; e < n_total_expert; e++) {
-        if (!expert_used[e]) continue;
-        uint64_t eo = (uint64_t)e * gate_expert_bytes;
-        memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
-        memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
-        /* down might have different expert_bytes */
-        uint64_t edo = (uint64_t)e * down_expert_bytes;
-        memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+    {
+        /* Count selected experts and pack their indices. */
+        uint32_t sel_count = 0;
+        uint32_t sel_list[256];
+        for (uint32_t e = 0; e < n_total_expert; e++)
+            if (expert_used[e]) sel_list[sel_count++] = e;
+
+        uint32_t n_threads = (uint32_t)std::thread::hardware_concurrency();
+        if (n_threads < 1) n_threads = 1;
+        uint32_t chunk = (sel_count + n_threads - 1) / n_threads;
+        std::vector<std::thread> threads;
+        threads.reserve(n_threads);
+        for (uint32_t t = 0; t < n_threads && t * chunk < sel_count; t++) {
+            uint32_t start = t * chunk;
+            uint32_t end   = std::min(start + chunk, sel_count);
+            threads.emplace_back([=]() {
+                for (uint32_t i = start; i < end; i++) {
+                    uint32_t e = sel_list[i];
+                    uint64_t eo = (uint64_t)e * gate_expert_bytes;
+                    memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
+                    memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
+                    uint64_t edo = (uint64_t)e * down_expert_bytes;
+                    memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+                }
+            });
+        }
+        for (auto &t : threads) t.join();
     }
 
     const char *gate_w = moe_host_gate;
@@ -4143,7 +4165,7 @@ static int sycl_routed_moe_launch(
        via sub-group reduction. */
     auto t_k1 = std::chrono::steady_clock::now();
     if (q4k_path) {
-        if (gate_row_bytes < sizeof(uint16_t) + 12 + 128) return 0;
+        if (gate_row_bytes < sizeof(sycl_block_q4_K)) return 0;
         g_queue->submit([&](sycl::handler &h) {
             h.parallel_for(sycl::nd_range<2>(
                 sycl::range<2>(expert_mid_dim, pair_count * 16),
@@ -4158,40 +4180,49 @@ static int sycl_routed_moe_launch(
                 int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
                 if (expert_i < 0) expert_i = 0;
                 uint32_t expert = (uint32_t)expert_i;
-                const uint8_t *gr = (const uint8_t *)(gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-                const uint8_t *ur = (const uint8_t *)(up_w   + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                const sycl_block_q4_K *gr = (const sycl_block_q4_K *)(gate_w + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                const sycl_block_q4_K *ur = (const sycl_block_q4_K *)(up_w   + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
                 const float *xr = x_ptr + (uint64_t)tok * expert_in_dim;
                 uint32_t nb = expert_in_dim / qk_k;
                 float gate = 0.0f, up = 0.0f;
                 for (uint32_t b = 0; b < nb; b++) {
-                    const uint8_t *gblk = gr + b * (sizeof(uint16_t) + 12 + 128);
-                    const uint8_t *ublk = ur + b * (sizeof(uint16_t) + 12 + 128);
+                    const sycl_block_q4_K *gb = gr + b;
+                    const sycl_block_q4_K *ub = ur + b;
                     const float *xblk = xr + (uint64_t)b * qk_k;
-                    float gd = sycl_f16_to_f32(*(const uint16_t *)gblk);
-                    float gdmin = sycl_f16_to_f32(*((const uint16_t *)gblk + 1));
-                    float ud = sycl_f16_to_f32(*(const uint16_t *)ublk);
-                    float udmin = sycl_f16_to_f32(*((const uint16_t *)ublk + 1));
-                    const uint8_t *gsc = gblk + sizeof(uint16_t) * 2;
-                    const uint8_t *gqs = gblk + sizeof(uint16_t) * 2 + 12;
-                    const uint8_t *usc = ublk + sizeof(uint16_t) * 2;
-                    const uint8_t *uqs = ublk + sizeof(uint16_t) * 2 + 12;
+                    float gd = sycl_f16_to_f32(gb->d);
+                    float gdmin = sycl_f16_to_f32(gb->dmin);
+                    float ud = sycl_f16_to_f32(ub->d);
+                    float udmin = sycl_f16_to_f32(ub->dmin);
+                    const uint8_t *gsc = gb->scales;
+                    const uint8_t *gqs = gb->qs;
+                    const uint8_t *usc = ub->scales;
+                    const uint8_t *uqs = ub->qs;
                     for (uint32_t il = 0; il < 16; il++) {
-                        uint32_t chunk = il / 8u;
-                        uint32_t pair_il = il & 1u;
-                        uint32_t shift = ((il / 2u) & 3u) * 2u;
-                        float gdl = gd * (float)((gsc[il] >> (shift & 3u)) & 3u);
-                        float gml = gdmin * (float)((gsc[il] >> (4u + (shift & 3u))) & 3u);
-                        float udl = ud * (float)((usc[il] >> (shift & 3u)) & 3u);
-                        float uml = udmin * (float)((usc[il] >> (4u + (shift & 3u))) & 3u);
-                        const uint8_t *gqblk = gqs + chunk * 64u + pair_il * 32u;
-                        const uint8_t *uqblk = uqs + chunk * 64u + pair_il * 32u;
-                        const float *xblk_off = xblk + chunk * 128u + ((il % 8u) / 2u) * 32u + pair_il * 16u;
-                        if (lane < 16) {
-                            float gw = gdl * (float)((gqblk[lane] >> (shift & 3u)) & 0x0fu) - gml;
-                            float uw = udl * (float)((uqblk[lane] >> (shift & 3u)) & 0x0fu) - uml;
-                            gate += gw * xblk_off[lane];
-                            up   += uw * xblk_off[lane];
+                        uint32_t j = il / 2u;
+                        uint32_t k = (il % 2u) * 16u + lane;
+                        uint8_t gsc_h, gsm_h, usc_h, usm_h;
+                        if (j < 4u) {
+                            gsc_h = gsc[j] & 63u;
+                            gsm_h = gsc[j + 4u] & 63u;
+                            usc_h = usc[j] & 63u;
+                            usm_h = usc[j + 4u] & 63u;
+                        } else {
+                            gsc_h = (gsc[j + 4u] & 0x0fu) | ((gsc[j - 4u] >> 6u) << 4u);
+                            gsm_h = (gsc[j + 4u] >> 4u) | ((gsc[j] >> 6u) << 4u);
+                            usc_h = (usc[j + 4u] & 0x0fu) | ((usc[j - 4u] >> 6u) << 4u);
+                            usm_h = (usc[j + 4u] >> 4u) | ((usc[j] >> 6u) << 4u);
                         }
+                        float gdl = gd * (float)gsc_h;
+                        float gml = gdmin * (float)gsm_h;
+                        float udl = ud * (float)usc_h;
+                        float uml = udmin * (float)usm_h;
+                        uint32_t qs_idx = (j / 2u) * 32u + (j % 2u) * 16u + k / 2u;
+                        uint32_t ns = (k & 1u) * 4u;
+                        float gw = gdl * (float)((gqs[qs_idx] >> ns) & 0x0fu) - gml;
+                        float uw = udl * (float)((uqs[qs_idx] >> ns) & 0x0fu) - uml;
+                        uint32_t x_off = (il / 8u) * 128u + ((il % 8u) / 2u) * 32u + (il & 1u) * 16u + lane;
+                        gate += gw * xblk[x_off];
+                        up   += uw * xblk[x_off];
                     }
                 }
                 gate = sycl::reduce_over_group(sg, gate, sycl::plus<float>());
@@ -4249,48 +4280,101 @@ static int sycl_routed_moe_launch(
     /* Kernel 2: down projection for every (row, pair).
        Work-group (1,16) — sub-group parallelizes inner 16-element loop. */
     auto t_k2 = std::chrono::steady_clock::now();
-    g_queue->submit([&](sycl::handler &h) {
-        h.parallel_for(sycl::nd_range<2>(
-            sycl::range<2>(out_dim, pair_count * 16),
-            sycl::range<2>(1, 16)), [=](sycl::nd_item<2> item) {
-            uint32_t row  = item.get_global_id(0);
-            uint32_t pair = item.get_global_id(1) / 16;
-            uint32_t lane = item.get_sub_group().get_local_id();
-            if (row >= out_dim || pair >= pair_count) return;
-            auto sg = item.get_sub_group();
-            uint32_t tok  = pair / n_expert;
-            uint32_t slot = pair - tok * n_expert;
-            int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
-            if (expert_i < 0) expert_i = 0;
-            uint32_t expert = (uint32_t)expert_i;
-            const sycl_block_q2_K *wr = (const sycl_block_q2_K *)(down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
-            const float *xr = mid_out + (uint64_t)pair * expert_mid_dim;
-            uint32_t nb = expert_mid_dim / qk_k;
-            float acc = 0.0f;
-            for (uint32_t b = 0; b < nb; b++) {
-                const sycl_block_q2_K *xb = wr + b;
-                float d    = sycl_f16_to_f32(xb->d);
-                float dmin = sycl_f16_to_f32(xb->dmin);
-                for (uint32_t il = 0; il < 16; il++) {
-                    uint32_t chunk = il / 8u;
-                    uint32_t pair_il = il & 1u;
-                    uint32_t shift = ((il / 2u) & 3u) * 2u;
-                    uint8_t sc = xb->scales[il];
-                    float dl = d * (float)(sc & 0x0fu);
-                    float ml = dmin * (float)(sc >> 4);
-                    const uint8_t *q = xb->qs + 32u * chunk + 16u * pair_il;
-                    const float *xf = xr + (uint64_t)b * qk_k + chunk * 128u + ((il % 8u) / 2u) * 32u + pair_il * 16u;
-                    if (lane < 16) {
-                        float w = dl * (float)((q[lane] >> shift) & 3u) - ml;
-                        acc += w * xf[lane];
+    if (q4k_path) {
+        g_queue->submit([&](sycl::handler &h) {
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(out_dim, pair_count * 16),
+                sycl::range<2>(1, 16)), [=](sycl::nd_item<2> item) {
+                uint32_t row  = item.get_global_id(0);
+                uint32_t pair = item.get_global_id(1) / 16;
+                uint32_t lane = item.get_sub_group().get_local_id();
+                if (row >= out_dim || pair >= pair_count) return;
+                auto sg = item.get_sub_group();
+                uint32_t tok  = pair / n_expert;
+                uint32_t slot = pair - tok * n_expert;
+                int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
+                if (expert_i < 0) expert_i = 0;
+                uint32_t expert = (uint32_t)expert_i;
+                const sycl_block_q4_K *wr = (const sycl_block_q4_K *)(down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                const float *xr = mid_out + (uint64_t)pair * expert_mid_dim;
+                uint32_t nb = expert_mid_dim / qk_k;
+                float acc = 0.0f;
+                for (uint32_t b = 0; b < nb; b++) {
+                    const sycl_block_q4_K *wb = wr + b;
+                    const float *xblk = xr + (uint64_t)b * qk_k;
+                    float d    = sycl_f16_to_f32(wb->d);
+                    float dmin = sycl_f16_to_f32(wb->dmin);
+                    const uint8_t *sc = wb->scales;
+                    const uint8_t *qs = wb->qs;
+                    for (uint32_t il = 0; il < 16; il++) {
+                        uint32_t j = il / 2u;
+                        uint32_t k = (il % 2u) * 16u + lane;
+                        uint8_t sc_h, sm_h;
+                        if (j < 4u) {
+                            sc_h = sc[j] & 63u;
+                            sm_h = sc[j + 4u] & 63u;
+                        } else {
+                            sc_h = (sc[j + 4u] & 0x0fu) | ((sc[j - 4u] >> 6u) << 4u);
+                            sm_h = (sc[j + 4u] >> 4u) | ((sc[j] >> 6u) << 4u);
+                        }
+                        float dl = d * (float)sc_h;
+                        float ml = dmin * (float)sm_h;
+                        uint32_t qs_idx = (j / 2u) * 32u + (j % 2u) * 16u + k / 2u;
+                        uint32_t ns = (k & 1u) * 4u;
+                        float w = dl * (float)((qs[qs_idx] >> ns) & 0x0fu) - ml;
+                        uint32_t x_off = (il / 8u) * 128u + ((il % 8u) / 2u) * 32u + (il & 1u) * 16u + lane;
+                        acc += w * xblk[x_off];
                     }
                 }
-            }
-            acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-            if (lane == 0)
-                down_out[(uint64_t)pair * out_dim + row] = acc;
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0)
+                    down_out[(uint64_t)pair * out_dim + row] = acc;
+            });
         });
-    });
+    } else {
+        g_queue->submit([&](sycl::handler &h) {
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(out_dim, pair_count * 16),
+                sycl::range<2>(1, 16)), [=](sycl::nd_item<2> item) {
+                uint32_t row  = item.get_global_id(0);
+                uint32_t pair = item.get_global_id(1) / 16;
+                uint32_t lane = item.get_sub_group().get_local_id();
+                if (row >= out_dim || pair >= pair_count) return;
+                auto sg = item.get_sub_group();
+                uint32_t tok  = pair / n_expert;
+                uint32_t slot = pair - tok * n_expert;
+                int32_t expert_i = sel_ptr[(uint64_t)tok * n_expert + slot];
+                if (expert_i < 0) expert_i = 0;
+                uint32_t expert = (uint32_t)expert_i;
+                const sycl_block_q2_K *wr = (const sycl_block_q2_K *)(down_w + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                const float *xr = mid_out + (uint64_t)pair * expert_mid_dim;
+                uint32_t nb = expert_mid_dim / qk_k;
+                float acc = 0.0f;
+                for (uint32_t b = 0; b < nb; b++) {
+                    const sycl_block_q2_K *xb = wr + b;
+                    float d    = sycl_f16_to_f32(xb->d);
+                    float dmin = sycl_f16_to_f32(xb->dmin);
+                    for (uint32_t il = 0; il < 16; il++) {
+                        uint32_t chunk = il / 8u;
+                        uint32_t pair_il = il & 1u;
+                        uint32_t shift = ((il / 2u) & 3u) * 2u;
+                        uint8_t sc = xb->scales[il];
+                        float dl = d * (float)(sc & 0x0fu);
+                        float ml = dmin * (float)(sc >> 4);
+                        const uint8_t *q = xb->qs + 32u * chunk + 16u * pair_il;
+                        const float *xf = xr + (uint64_t)b * qk_k + chunk * 128u + ((il % 8u) / 2u) * 32u + pair_il * 16u;
+                        if (lane < 16) {
+                            float w = dl * (float)((q[lane] >> shift) & 3u) - ml;
+                            acc += w * xf[lane];
+                        }
+                    }
+                }
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0)
+                    down_out[(uint64_t)pair * out_dim + row] = acc;
+            });
+        });
+    }
 
     double ms_k2 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_k2).count();
     if (ms_k2 > 1.0) fprintf(stderr, "ds4: SYCL moe_k2 %d %.0f ms\n", layer_index, ms_k2);
