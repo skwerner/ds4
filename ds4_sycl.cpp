@@ -868,6 +868,9 @@ static int sycl_stream_selected_cache_begin_compact_load(
     return 1;
 }
 
+static char *moe_host_gate = nullptr, *moe_host_up = nullptr, *moe_host_down = nullptr;
+static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_bytes = 0;
+
 /* =========================================================================
  * helpers: model range caching
  * ========================================================================= */
@@ -886,45 +889,59 @@ static std::mutex                    g_model_ranges_mutex;
  *
  * Two-tier caching:
  *   1. Exact match – same (host_base, offset, bytes) → return existing pointer.
- *      Handles within-layer repeats (e.g. same weight used twice in a session).
  *   2. Stale reuse – a buffer from a previous layer marked "available"
- *      (offset == UINT64_MAX).  Copy new data in and update offset.
- *      This reuses device allocations across layers without alloc/free cycles.
+ *      (offset == UINT64_MAX).  Copy new data in with CPU memcpy (fast RAM
+ *      copy into pre-pinned host memory), then update offset.
  *
- * New allocations happen only for the first layer.  After that, every weight
- * finds either an exact match (unlikely across layers) or an available
- * same-size buffer to reuse.
+ * The buffer type is USM host (malloc_host) — pinned system RAM accessible
+ * by both CPU and GPU.  No DMA channel setup is needed; the GPU kernel reads
+ * weight data over PCIe on demand.  For n_tokens=1 this adds ~5 ms of PCIe
+ * latency per layer, negligible compared to Level Zero page-pinning overhead
+ * which costs ~1063 ms per 1.125 GiB transfer.
  *
- * memcpy is submitted to the in-order queue without block-on-copy wait().
- * In-order guarantees no subsequent queue op reads the buffer before the
- * copy completes, so a host-side wait is pure overhead. */
+ * New host allocations happen only for the first layer.  After that, every
+ * weight finds either an exact match or an available same-size buffer to
+ * reuse — no further allocation cost. */
 static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    static int prof_map = -1;
+    if (prof_map < 0) prof_map = getenv("DS4_SYCL_PROFILE_MAP") != nullptr;
+    auto t0 = std::chrono::steady_clock::now();
     if (!g_queue) return nullptr;
     if (bytes == 0) return (const char *)model_map + offset;
     bool is_expert = (what[0] == 'm' && what[1] == 'o' && what[2] == 'e' && what[3] == '_');
     {
+        /* Attempt 1: exact match (same host_base + offset + bytes). */
         std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
-        /* 1. Exact match: same host_base + offset + bytes */
         for (auto &r : g_model_ranges) {
             if (r.host_base == model_map && offset >= r.offset && offset + bytes <= r.offset + r.bytes) {
                 return r.device_ptr + (offset - r.offset);
             }
         }
-        /* 2. Reuse a stale entry (same host_base, same bytes, marked available) */
+        /* Attempt 2: stale reuse — same bytes, marked available.  Overwrite
+         * with CPU memcpy (pre-pinned host buffer → no DMA submit overhead). */
         for (auto &r : g_model_ranges) {
             if (r.host_base == model_map && r.bytes == bytes && r.offset == UINT64_MAX && r.device_ptr) {
-                memcpy(r.device_ptr, (const char *)model_map + offset, bytes);
+                const char *src = (const char *)model_map + offset;
+                memcpy(r.device_ptr, src, bytes);
                 r.offset = offset;
                 return r.device_ptr;
             }
         }
     }
+    /* Attempt 3: fresh allocation (first layer only for any given size). */
     try {
-        char *dptr = (char *)sycl::malloc_shared(bytes, *g_queue);
-        if (!dptr) { fprintf(stderr, "ds4: sycl_model_range_ptr(%s) malloc failed for %lu bytes\n", what, (unsigned long)bytes); return nullptr; }
-        memcpy(dptr, (const char *)model_map + offset, bytes);
-        std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
-        g_model_ranges.push_back({model_map, offset, bytes, dptr, is_expert});
+        auto t_alloc = std::chrono::steady_clock::now();
+        char *dptr = (char *)sycl::malloc_host(bytes, g_queue->get_context());
+        if (!dptr) { fprintf(stderr, "ds4: sycl_model_range_ptr(%s) malloc_host failed for %lu bytes\n", what, (unsigned long)bytes); return nullptr; }
+        double ms_alloc = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_alloc).count();
+        const char *src = (const char *)model_map + offset;
+        memcpy(dptr, src, bytes);
+        double ms_tot = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+        {
+            std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
+            g_model_ranges.push_back({model_map, offset, bytes, dptr, is_expert});
+        }
+        if (prof_map) fprintf(stderr, "ds4: map_cache fresh %s alloc=%.0f cp=%.0f total=%.0f ms\n", what, ms_alloc, ms_tot - ms_alloc, ms_tot);
         return dptr;
     } catch (...) { return nullptr; }
 }
@@ -1017,6 +1034,7 @@ extern "C" int ds4_gpu_init(void) {
  * wait_and_throw() here for performance.  All error propagation is handled
  * by end_commands() or the next explicit sync point. */
 extern "C" void ds4_gpu_clear_cached_model_ranges(void) {
+    if (g_queue) g_queue->wait();
     for (auto &r : g_model_ranges)
         r.offset = UINT64_MAX;
 }
@@ -1042,6 +1060,12 @@ extern "C" void ds4_gpu_cleanup(void) {
 
     if (g_f16_xh)    sycl::free(g_f16_xh, *g_queue);
     g_f16_xh = nullptr; g_f16_xh_cap = 0;
+
+    if (moe_host_gate)   sycl::free(moe_host_gate, *g_queue);
+    if (moe_host_up)     sycl::free(moe_host_up, *g_queue);
+    if (moe_host_down)   sycl::free(moe_host_down, *g_queue);
+    moe_host_gate = moe_host_up = moe_host_down = nullptr;
+    moe_host_gate_bytes = moe_host_up_bytes = moe_host_down_bytes = 0;
 
     sycl_stream_selected_cache_release_all();
     sycl_stream_expert_cache_release_all();
@@ -4044,14 +4068,63 @@ static int sycl_routed_moe_launch(
         gate_bytes > model_size - up_offset ||
         down_bytes > model_size - down_offset)
         return 0;
-    /* Map model weights to device (shared memory — no explicit GPU memcpy) */
+
+    /* ---- Selective expert copy (instead of full-tensor DMA) ---- */
     auto t_map = std::chrono::steady_clock::now();
-    const char *gate_w = sycl_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w   = sycl_model_range_ptr(model_map, up_offset,   gate_bytes, "moe_up");
-    const char *down_w = sycl_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
+
+    /* Allocate host-pinned buffers on first call (or if size changed). */
+    auto alloc_host = [&](char *&buf, uint64_t &buf_bytes, uint64_t needed, const char *name) {
+        if (buf && buf_bytes != needed) { sycl::free(buf, *g_queue); buf = nullptr; }
+        if (!buf) {
+            buf = (char *)sycl::malloc_host(needed, g_queue->get_context());
+            buf_bytes = needed;
+            if (!buf) fprintf(stderr, "ds4: moe_host %s malloc_host(%lu) failed\n", name, (unsigned long)needed);
+        }
+        return buf != nullptr;
+    };
+    if (!alloc_host(moe_host_gate, moe_host_gate_bytes, gate_bytes, "gate") ||
+        !alloc_host(moe_host_up,   moe_host_up_bytes,   gate_bytes, "up")   ||
+        !alloc_host(moe_host_down, moe_host_down_bytes, down_bytes, "down"))
+        return 0;
+
+    /* Copy selected expert indices from device to host (tiny, ~240 bytes). */
+    uint32_t n_pairs = n_tokens * n_expert;
+    int32_t sel_host_stk[256];
+    int32_t *sel_host = (n_pairs <= 256) ? sel_host_stk : (int32_t *)malloc(n_pairs * sizeof(int32_t));
+    if (n_pairs > 256 && !sel_host) return 0;
+    try {
+        g_queue->memcpy(sel_host, selected->ptr, n_pairs * sizeof(int32_t)).wait();
+    } catch (...) { if (sel_host != sel_host_stk) free(sel_host); return 0; }
+
+    /* Collect unique expert indices selected across all tokens. */
+    bool expert_used[256] = {false};
+    uint32_t n_uniq = 0;
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        int32_t e = sel_host[i];
+        if (e >= 0 && (uint32_t)e < n_total_expert && !expert_used[e]) {
+            expert_used[e] = true;
+            n_uniq++;
+        }
+    }
+    if (sel_host != sel_host_stk) free(sel_host);
+
+    /* Copy only the selected experts' weight blocks from mmap to host buffer. */
+    const char *mmap = (const char *)model_map;
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        if (!expert_used[e]) continue;
+        uint64_t eo = (uint64_t)e * gate_expert_bytes;
+        memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
+        memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
+        /* down might have different expert_bytes */
+        uint64_t edo = (uint64_t)e * down_expert_bytes;
+        memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+    }
+
+    const char *gate_w = moe_host_gate;
+    const char *up_w   = moe_host_up;
+    const char *down_w = moe_host_down;
     double ms_map = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_map).count();
-    if (ms_map > 1.0) fprintf(stderr, "ds4: SYCL moe_map %d %.0f ms (shared)\n", layer_index, ms_map);
+    if (ms_map > 1.0) fprintf(stderr, "ds4: SYCL moe_map %d %.0f ms (sel=%u)\n", layer_index, ms_map, n_uniq);
 
     uint32_t pair_count = n_tokens * n_expert;
     const int32_t *sel_ptr = (const int32_t *)selected->ptr;
