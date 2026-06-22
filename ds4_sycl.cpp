@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <dlfcn.h>
 
 #define DS4_SYCL_UNUSED __attribute__((unused))
 #define DS4_SYCL_MAX_STREAMS 4
@@ -871,6 +872,7 @@ static int sycl_stream_selected_cache_begin_compact_load(
 
 static char *moe_host_gate = nullptr, *moe_host_up = nullptr, *moe_host_down = nullptr;
 static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_bytes = 0;
+static bool g_model_imported = false;
 
 /* =========================================================================
  * helpers: model range caching
@@ -908,7 +910,7 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
     if (prof_map < 0) prof_map = getenv("DS4_SYCL_PROFILE_MAP") != nullptr;
     auto t0 = std::chrono::steady_clock::now();
     if (!g_queue) return nullptr;
-    if (bytes == 0) return (const char *)model_map + offset;
+    if (bytes == 0 || g_model_imported) return (const char *)model_map + offset;
     bool is_expert = (what[0] == 'm' && what[1] == 'o' && what[2] == 'e' && what[3] == '_');
     {
         /* Attempt 1: exact match (same host_base + offset + bytes). */
@@ -970,6 +972,39 @@ extern "C" void ds4_gpu_prepare_model_memory(const void *model_map, uint64_t mod
     for (; p < end; p += 4096) sink += *p;
     (void)sink;
 #endif
+
+    /* Try to import model mmap as Level Zero external memory, enabling direct
+     * GPU access without CPU memcpy. zexDriverImportExternalPointer tells the
+     * Intel GPU driver to pin the mmap pages and expose them to the DMA engine.
+     * Falls back to CPU copy path if the extension is unavailable or fails. */
+    try {
+        if (!g_queue) { fprintf(stderr, "ds4: g_queue not initialized — skipping Level Zero import\n"); return; }
+        auto platform = g_queue->get_context().get_platform();
+        auto ze_driver = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(platform);
+        /* Look up zexDriverImportExternalPointer via dlsym from the already-
+         * loaded libze_intel_gpu.so (loaded as a dependency of libze_loader). */
+        void *handle = dlopen("libze_intel_gpu.so.1", RTLD_NOLOAD | RTLD_LAZY);
+        if (handle) {
+            using import_fn_t = int32_t (*)(void *, void *, size_t);
+            auto import_fn = (import_fn_t)dlsym(handle, "zexDriverImportExternalPointer");
+            if (import_fn) {
+                int32_t ze_ret = import_fn((void *)ze_driver, const_cast<void *>(model_map), model_size);
+                if (ze_ret == 0) {
+                    g_model_imported = true;
+                    fprintf(stderr, "ds4: Level Zero imported %llu MiB — direct GPU access to mmap enabled\n",
+                            (unsigned long long)(model_size >> 20));
+                } else {
+                    fprintf(stderr, "ds4: zexDriverImportExternalPointer failed (%d) — using copy path\n", (int)ze_ret);
+                }
+            } else {
+                fprintf(stderr, "ds4: zexDriverImportExternalPointer not found — using copy path\n");
+            }
+        } else {
+            fprintf(stderr, "ds4: libze_intel_gpu.so not loaded — using copy path\n");
+        }
+    } catch (std::exception &e) {
+        fprintf(stderr, "ds4: Level Zero import error: %s — using copy path\n", e.what());
+    }
 }
 
 /* Helper: f32->f16 conversion kernel (used by f16 matmul batched path). */
@@ -1078,6 +1113,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_context     = nullptr;
     g_device      = nullptr;
     g_initialized = 0;
+    g_model_imported = false;
 }
 
 extern "C" uint64_t ds4_gpu_vram_total(void) {
@@ -4263,97 +4299,106 @@ static int sycl_routed_moe_launch(
         down_bytes > model_size - down_offset)
         return 0;
 
-    /* ---- Selective expert copy (instead of full-tensor DMA) ---- */
+    /* ---- Selective expert copy (or direct mmap access if imported) ---- */
     auto t_map = std::chrono::steady_clock::now();
-
-    /* Allocate host-pinned buffers on first call (or if size changed). */
-    auto alloc_host = [&](char *&buf, uint64_t &buf_bytes, uint64_t needed, const char *name) {
-        if (buf && buf_bytes != needed) { sycl::free(buf, *g_queue); buf = nullptr; }
-        if (!buf) {
-            buf = (char *)sycl::malloc_host(needed, g_queue->get_context());
-            buf_bytes = needed;
-            if (!buf) fprintf(stderr, "ds4: moe_host %s malloc_host(%lu) failed\n", name, (unsigned long)needed);
-        }
-        return buf != nullptr;
-    };
-    if (!alloc_host(moe_host_gate, moe_host_gate_bytes, gate_bytes, "gate") ||
-        !alloc_host(moe_host_up,   moe_host_up_bytes,   gate_bytes, "up")   ||
-        !alloc_host(moe_host_down, moe_host_down_bytes, down_bytes, "down"))
-        return 0;
-
-    /* Copy selected expert indices from device to host (tiny, ~240 bytes). */
-    uint32_t n_pairs = n_tokens * n_expert;
-    int32_t sel_host_stk[256];
-    int32_t *sel_host = (n_pairs <= 256) ? sel_host_stk : (int32_t *)malloc(n_pairs * sizeof(int32_t));
-    if (n_pairs > 256 && !sel_host) return 0;
-    try {
-        g_queue->memcpy(sel_host, selected->ptr, n_pairs * sizeof(int32_t)).wait();
-    } catch (...) { if (sel_host != sel_host_stk) free(sel_host); return 0; }
-
-    /* Collect unique expert indices selected across all tokens. */
-    bool expert_used[256] = {false};
+    const char *gate_w, *up_w, *down_w;
     uint32_t n_uniq = 0;
-    for (uint32_t i = 0; i < n_pairs; i++) {
-        int32_t e = sel_host[i];
-        if (e >= 0 && (uint32_t)e < n_total_expert && !expert_used[e]) {
-            expert_used[e] = true;
-            n_uniq++;
-        }
-    }
-    if (sel_host != sel_host_stk) free(sel_host);
 
-    /* Copy only the selected experts' weight blocks from mmap to host buffer.
-     * Parallelized across all available hardware cores — each expert's three
-     * tensors are independent.  For small expert counts (decode path) a
-     * single-threaded loop avoids std::thread creation overhead (~7 ms vs
-     * ~0.1 ms for 6 experts). */
-    const char *mmap = (const char *)model_map;
-    {
-        uint32_t sel_count = 0;
-        uint32_t sel_list[256];
-        for (uint32_t e = 0; e < n_total_expert; e++)
-            if (expert_used[e]) sel_list[sel_count++] = e;
-
-        if (sel_count <= 8) {
-            for (uint32_t i = 0; i < sel_count; i++) {
-                uint32_t e = sel_list[i];
-                uint64_t eo = (uint64_t)e * gate_expert_bytes;
-                memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
-                memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
-                uint64_t edo = (uint64_t)e * down_expert_bytes;
-                memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+    if (g_model_imported) {
+        /* Model mmap is Level Zero imported — GPU can read weights directly. */
+        const char *mmap = (const char *)model_map;
+        gate_w = mmap + gate_offset;
+        up_w   = mmap + up_offset;
+        down_w = mmap + down_offset;
+    } else {
+        /* Standard path: allocate USM host buffers and copy selected experts. */
+        auto alloc_host = [&](char *&buf, uint64_t &buf_bytes, uint64_t needed, const char *name) {
+            if (buf && buf_bytes != needed) { sycl::free(buf, *g_queue); buf = nullptr; }
+            if (!buf) {
+                buf = (char *)sycl::malloc_host(needed, g_queue->get_context());
+                buf_bytes = needed;
+                if (!buf) fprintf(stderr, "ds4: moe_host %s malloc_host(%lu) failed\n", name, (unsigned long)needed);
             }
-        } else {
-            uint32_t n_threads = (uint32_t)std::thread::hardware_concurrency();
-            if (n_threads < 1) n_threads = 1;
-            uint32_t chunk = (sel_count + n_threads - 1) / n_threads;
-            std::vector<std::thread> threads;
-            threads.reserve(n_threads);
-            for (uint32_t t = 0; t < n_threads && t * chunk < sel_count; t++) {
-                uint32_t start = t * chunk;
-                uint32_t end   = std::min(start + chunk, sel_count);
-                threads.emplace_back([=]() {
-                    const char *m = mmap;
-                    char *mg = moe_host_gate, *mu = moe_host_up, *md = moe_host_down;
-                    uint64_t go = gate_offset, uo = up_offset, ge = gate_expert_bytes;
-                    uint64_t de = down_expert_bytes, doff = down_offset;
-                    for (uint32_t i = start; i < end; i++) {
-                        uint32_t e = sel_list[i];
-                        uint64_t eo = (uint64_t)e * ge;
-                        memcpy(mg + eo, m + go + eo, ge);
-                        memcpy(mu + eo, m + uo + eo, ge);
-                        uint64_t edo = (uint64_t)e * de;
-                        memcpy(md + edo, m + doff + edo, de);
-                    }
-                });
-            }
-            for (auto &t : threads) t.join();
-        }
-    }
+            return buf != nullptr;
+        };
+        if (!alloc_host(moe_host_gate, moe_host_gate_bytes, gate_bytes, "gate") ||
+            !alloc_host(moe_host_up,   moe_host_up_bytes,   gate_bytes, "up")   ||
+            !alloc_host(moe_host_down, moe_host_down_bytes, down_bytes, "down"))
+            return 0;
 
-    const char *gate_w = moe_host_gate;
-    const char *up_w   = moe_host_up;
-    const char *down_w = moe_host_down;
+        /* Copy selected expert indices from device to host (tiny, ~240 bytes). */
+        uint32_t n_pairs = n_tokens * n_expert;
+        int32_t sel_host_stk[256];
+        int32_t *sel_host = (n_pairs <= 256) ? sel_host_stk : (int32_t *)malloc(n_pairs * sizeof(int32_t));
+        if (n_pairs > 256 && !sel_host) return 0;
+        try {
+            g_queue->memcpy(sel_host, selected->ptr, n_pairs * sizeof(int32_t)).wait();
+        } catch (...) { if (sel_host != sel_host_stk) free(sel_host); return 0; }
+
+        /* Collect unique expert indices selected across all tokens. */
+        bool expert_used[256] = {false};
+        for (uint32_t i = 0; i < n_pairs; i++) {
+            int32_t e = sel_host[i];
+            if (e >= 0 && (uint32_t)e < n_total_expert && !expert_used[e]) {
+                expert_used[e] = true;
+                n_uniq++;
+            }
+        }
+        if (sel_host != sel_host_stk) free(sel_host);
+
+        /* Copy only the selected experts' weight blocks from mmap to host buffer.
+         * Parallelized across all available hardware cores — each expert's three
+         * tensors are independent.  For small expert counts (decode path) a
+         * single-threaded loop avoids std::thread creation overhead (~7 ms vs
+         * ~0.1 ms for 6 experts). */
+        const char *mmap = (const char *)model_map;
+        {
+            uint32_t sel_count = 0;
+            uint32_t sel_list[256];
+            for (uint32_t e = 0; e < n_total_expert; e++)
+                if (expert_used[e]) sel_list[sel_count++] = e;
+
+            if (sel_count <= 8) {
+                for (uint32_t i = 0; i < sel_count; i++) {
+                    uint32_t e = sel_list[i];
+                    uint64_t eo = (uint64_t)e * gate_expert_bytes;
+                    memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
+                    memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
+                    uint64_t edo = (uint64_t)e * down_expert_bytes;
+                    memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+                }
+            } else {
+                uint32_t n_threads = (uint32_t)std::thread::hardware_concurrency();
+                if (n_threads < 1) n_threads = 1;
+                uint32_t chunk = (sel_count + n_threads - 1) / n_threads;
+                std::vector<std::thread> threads;
+                threads.reserve(n_threads);
+                for (uint32_t t = 0; t < n_threads && t * chunk < sel_count; t++) {
+                    uint32_t start = t * chunk;
+                    uint32_t end   = std::min(start + chunk, sel_count);
+                    threads.emplace_back([=]() {
+                        const char *m = mmap;
+                        char *mg = moe_host_gate, *mu = moe_host_up, *md = moe_host_down;
+                        uint64_t go = gate_offset, uo = up_offset, ge = gate_expert_bytes;
+                        uint64_t de = down_expert_bytes, doff = down_offset;
+                        for (uint32_t i = start; i < end; i++) {
+                            uint32_t e = sel_list[i];
+                            uint64_t eo = (uint64_t)e * ge;
+                            memcpy(mg + eo, m + go + eo, ge);
+                            memcpy(mu + eo, m + uo + eo, ge);
+                            uint64_t edo = (uint64_t)e * de;
+                            memcpy(md + edo, m + doff + edo, de);
+                        }
+                    });
+                }
+                for (auto &t : threads) t.join();
+            }
+        }
+
+        gate_w = moe_host_gate;
+        up_w   = moe_host_up;
+        down_w = moe_host_down;
+    }
     double ms_map = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_map).count();
     if (ms_map > 1.0) fprintf(stderr, "ds4: SYCL moe_map %d %.0f ms (sel=%u)\n", layer_index, ms_map, n_uniq);
 
