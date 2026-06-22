@@ -193,17 +193,18 @@ especially with large KV cache sizes.
 
 | Metric | Value |
 |--------|-------|
-| Model size | ~141 GiB (DeepSeek V4 Flash) |
+| Model size | ~141 GiB (DeepSeek V4 Flash, 43 layers) |
 | System RAM | ~292 GB |
-| GPU | Intel Arc A750 (12.55.8 driver) |
+| GPU | Intel Arc A750 (12.55.8 driver, Level Zero 1.14.37020) |
 | PCIe | Gen4 ×16 (56 GiB/s) |
-| Heavy kernel submission overhead | ~1.7-2.1 ms per `parallel_for` |
+| Heavy kernel submission overhead | ~1.7-2.1 ms per `parallel_for` (root cause unknown) |
 | Light kernel overhead | <0.1 ms |
-| Encode time (baseline) | 3923 ms/token |
-| Encode time (after quantize fusion) | 2747 ms/token |
-| GPU execute time | ~57 ms/token |
-| Throughput | 0.30 t/s |
+| Encode time (current, quantize fusion + imm CL) | ~3916 ms/token |
+| GPU execute time (w/o immediate CL) | ~57 ms/token |
+| GPU execute time (w/ immediate CL) | ~2 ms/token |
+| Throughput | 0.22 t/s |
 | MoE expert copy (6 experts, decode) | ~0.1 ms/layer (after single-thread fix) |
 | MoE expert copy (original pthreads) | ~7 ms/layer |
-| Level Zero import target | ~2350 ms encode, 0.35 t/s |
-| Command graph target | ~2000 ms encode, 0.40 t/s |
+| Level Zero import status | Fails with `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE` on A750 |
+| Immediate CL effect | Shifts 2.1 ms overhead from `wait()` to `submit()`, no net gain |
+| Command graph estimate | Could save 300-400 ms if overhead is in per-kernel command list ops |

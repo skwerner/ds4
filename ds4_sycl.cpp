@@ -993,10 +993,12 @@ extern "C" void ds4_gpu_prepare_model_memory(const void *model_map, uint64_t mod
     /* Try to import model mmap as Level Zero external memory, enabling direct
      * GPU access without CPU memcpy. zexDriverImportExternalPointer tells the
      * Intel GPU driver to pin the mmap pages and expose them to the DMA engine.
-     * Falls back to CPU copy path if the extension is unavailable or fails. */
+     * Falls back to CPU copy path if the extension is unavailable or fails.
+     * Note: this runs before ds4_gpu_init, so we create a temporary device
+     * instead of using g_queue. */
     try {
-        if (!g_queue) { fprintf(stderr, "ds4: g_queue not initialized — skipping Level Zero import\n"); return; }
-        auto platform = g_queue->get_context().get_platform();
+        sycl::device tmp_dev(sycl::gpu_selector_v);
+        auto platform = tmp_dev.get_platform();
         auto ze_driver = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(platform);
         /* Look up zexDriverImportExternalPointer via dlsym from the already-
          * loaded libze_intel_gpu.so (loaded as a dependency of libze_loader). */
@@ -1068,8 +1070,10 @@ extern "C" int ds4_gpu_init(void) {
          * the two-step "create command list → submit to queue" overhead that
          * dominates per-kernel submission time (~2.1 ms). */
         g_queue   = new sycl::queue(*g_context, *g_device, ah,
-                                    sycl::property::queue::in_order{},
-                                    sycl::ext::oneapi::experimental::property::queue::immediate_command_list{});
+                                    sycl::property_list{
+                                        sycl::property::queue::in_order{},
+                                        sycl::ext::intel::property::queue::immediate_command_list{}
+                                    });
         g_initialized = 1;
         g_alloc_host = getenv("DS4_SYCL_ALLOC_HOST") != nullptr;
         if (g_alloc_host)
