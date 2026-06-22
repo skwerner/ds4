@@ -1902,6 +1902,165 @@ static void sycl_matmul_q8_0_preq_sg(sycl::queue &q,
     });
 }
 
+/* Fused quantize + Q8_0 matmul, single token.
+   Reads float input and quantizes on-the-fly per block, eliminating the
+   separate quantize kernel submission. */
+static void sycl_matmul_q8_0_fused_sg(sycl::queue &q,
+                                       float *out,
+                                       const uint8_t *w8,
+                                       const float *x,
+                                       uint64_t out_dim,
+                                       uint64_t blocks_per_row) {
+    sycl::range<1> global(round_up(out_dim, 8) * 16);
+    sycl::range<1> local(128);
+    q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+        uint64_t row = (uint64_t)item.get_global_id(0) / 16;
+        if (row >= out_dim) return;
+        auto sg = item.get_sub_group();
+        uint32_t lane = sg.get_local_id();
+        float acc = 0.0f;
+        for (uint64_t b = lane; b < blocks_per_row; b += 16) {
+            float vals[32];
+            for (int i = 0; i < 32; i++) vals[i] = x[b * 32 + i];
+            float amax = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                float v = vals[i] < 0 ? -vals[i] : vals[i];
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+            const uint8_t *block = w8 + (row * blocks_per_row + b) * 34;
+            uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+            float wscale = sycl_half_to_float(d_bits);
+            const int8_t *wq = (const int8_t *)(block + 2);
+            int dot = 0;
+            for (int i = 0; i < 32; i++) {
+                float scaled = vals[i] * id;
+                int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                if (qv > 127) qv = 127;
+                else if (qv < -128) qv = -128;
+                dot += (int)wq[i] * qv;
+            }
+            acc += wscale * d * (float)dot;
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) out[row] = acc;
+    });
+}
+
+/* Fused quantize + matmul for pair (two outputs from one input).
+   Each sub-group handles one row of both weight matrices, sharing the
+   on-the-fly quantization. */
+static void sycl_matmul_q8_0_fused_pair_sg(sycl::queue &q,
+                                            float *out0, float *out1,
+                                            const uint8_t *w0, const uint8_t *w1,
+                                            const float *x,
+                                            uint64_t out0_dim, uint64_t out1_dim,
+                                            uint64_t blocks_per_row) {
+    uint64_t max_dim = out0_dim > out1_dim ? out0_dim : out1_dim;
+    sycl::range<1> global(round_up(max_dim, 8) * 16);
+    sycl::range<1> local(128);
+    q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+        uint64_t row = (uint64_t)item.get_global_id(0) / 16;
+        if (row >= max_dim) return;
+        auto sg = item.get_sub_group();
+        uint32_t lane = sg.get_local_id();
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (uint64_t b = lane; b < blocks_per_row; b += 16) {
+            float vals[32];
+            for (int i = 0; i < 32; i++) vals[i] = x[b * 32 + i];
+            float amax = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                float v = vals[i] < 0 ? -vals[i] : vals[i];
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+            if (row < out0_dim) {
+                const uint8_t *block = w0 + (row * blocks_per_row + b) * 34;
+                uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+                float wscale = sycl_half_to_float(d_bits);
+                const int8_t *wq = (const int8_t *)(block + 2);
+                int dot = 0;
+                for (int i = 0; i < 32; i++) {
+                    float scaled = vals[i] * id;
+                    int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) qv = 127;
+                    else if (qv < -128) qv = -128;
+                    dot += (int)wq[i] * qv;
+                }
+                acc0 += wscale * d * (float)dot;
+            }
+            if (row < out1_dim) {
+                const uint8_t *block = w1 + (row * blocks_per_row + b) * 34;
+                uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+                float wscale = sycl_half_to_float(d_bits);
+                const int8_t *wq = (const int8_t *)(block + 2);
+                int dot = 0;
+                for (int i = 0; i < 32; i++) {
+                    float scaled = vals[i] * id;
+                    int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) qv = 127;
+                    else if (qv < -128) qv = -128;
+                    dot += (int)wq[i] * qv;
+                }
+                acc1 += wscale * d * (float)dot;
+            }
+        }
+        acc0 = sycl::reduce_over_group(sg, acc0, sycl::plus<float>());
+        if (lane == 0 && row < out0_dim) out0[row] = acc0;
+        acc1 = sycl::reduce_over_group(sg, acc1, sycl::plus<float>());
+        if (lane == 0 && row < out1_dim) out1[row] = acc1;
+    });
+}
+
+/* Fused quantize + batched Q8_0 matmul (n_tok > 1). */
+static void sycl_matmul_q8_0_fused_batch_sg(sycl::queue &q,
+                                              float *out,
+                                              const uint8_t *w8,
+                                              const float *x,
+                                              uint64_t out_dim,
+                                              uint64_t blocks_per_row,
+                                              uint64_t n_tok) {
+    sycl::range<2> global(round_up(out_dim, 8), n_tok * 16);
+    sycl::range<2> local(8, 16);
+    q.parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
+        uint64_t row = (uint64_t)item.get_global_id(0);
+        uint64_t tok = (uint64_t)item.get_global_id(1) / 16;
+        if (row >= out_dim || tok >= n_tok) return;
+        auto sg = item.get_sub_group();
+        uint32_t lane = sg.get_local_id();
+        const float *xr = x + tok * blocks_per_row * 32;
+        float acc = 0.0f;
+        for (uint64_t b = lane; b < blocks_per_row; b += 16) {
+            float vals[32];
+            for (int i = 0; i < 32; i++) vals[i] = xr[b * 32 + i];
+            float amax = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                float v = vals[i] < 0 ? -vals[i] : vals[i];
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+            const uint8_t *block = w8 + (row * blocks_per_row + b) * 34;
+            uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+            float wscale = sycl_half_to_float(d_bits);
+            const int8_t *wq = (const int8_t *)(block + 2);
+            int dot = 0;
+            for (int i = 0; i < 32; i++) {
+                float scaled = vals[i] * id;
+                int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                if (qv > 127) qv = 127;
+                else if (qv < -128) qv = -128;
+                dot += (int)wq[i] * qv;
+            }
+            acc += wscale * d * (float)dot;
+        }
+        acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+        if (lane == 0) out[tok * out_dim + row] = acc;
+    });
+}
+
 /* Batched pre-quantised Q8_0 matmul with sub-group reduction.
    Work-group: 8 sub-groups × 16 lanes = 128 work-items.
    Each sub-group handles one row. */
@@ -1956,22 +2115,13 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(
     const uint8_t *w8 = (const uint8_t *)wptr;
     try {
         if (n_tok > 1) {
-            if (!sycl_ensure_q8_bufs(n_tok, blocks_per_row)) return 0;
-            int8_t *xq = g_q8_xq;
-            float *xscale = g_q8_xscale;
-            sycl_quantize_q8_0(*g_queue, xq, xscale, (const float *)x->ptr,
-                               in_dim, blocks_per_row, n_tok);
-            sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out->ptr, w8,
-                                            xq, xscale, out_dim, blocks_per_row, n_tok);
+            sycl_matmul_q8_0_fused_batch_sg(*g_queue, (float *)out->ptr, w8,
+                                             (const float *)x->ptr,
+                                             out_dim, blocks_per_row, n_tok);
         } else {
-            /* Single token: pre-quantise + sub-group kernel. */
-            if (!sycl_ensure_q8_bufs(1, blocks_per_row)) return 0;
-            int8_t *xq = g_q8_xq;
-            float *xscale = g_q8_xscale;
-            sycl_quantize_q8_0(*g_queue, xq, xscale, (const float *)x->ptr,
-                               in_dim, blocks_per_row, 1);
-            sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out->ptr, w8,
-                                      xq, xscale, out_dim, blocks_per_row);
+            sycl_matmul_q8_0_fused_sg(*g_queue, (float *)out->ptr, w8,
+                                       (const float *)x->ptr,
+                                       out_dim, blocks_per_row);
         }
         return 1;
     } catch (sycl::exception &e) {
@@ -2000,16 +2150,20 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const uint8_t *w1 = (const uint8_t *)sycl_model_range_ptr(model_map, weight1_offset, w1_bytes, "q8_0");
     if (!w0 || !w1) return 0;
     try {
-        if (!sycl_ensure_q8_bufs(n_tok, blocks_per_row)) return 0;
-        int8_t *xq = g_q8_xq;
-        float *xscale = g_q8_xscale;
-        sycl_quantize_q8_0(*g_queue, xq, xscale, (const float *)x->ptr, in_dim, blocks_per_row, n_tok);
         if (n_tok > 1) {
-            sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out0->ptr, w0, xq, xscale, out0_dim, blocks_per_row, n_tok);
-            sycl_matmul_q8_0_preq_batch_sg(*g_queue, (float *)out1->ptr, w1, xq, xscale, out1_dim, blocks_per_row, n_tok);
+            sycl_matmul_q8_0_fused_batch_sg(*g_queue, (float *)out0->ptr, w0,
+                                             (const float *)x->ptr,
+                                             out0_dim, blocks_per_row, n_tok);
+            sycl_matmul_q8_0_fused_batch_sg(*g_queue, (float *)out1->ptr, w1,
+                                             (const float *)x->ptr,
+                                             out1_dim, blocks_per_row, n_tok);
         } else {
-            sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out0->ptr, w0, xq, xscale, out0_dim, blocks_per_row);
-            sycl_matmul_q8_0_preq_sg(*g_queue, (float *)out1->ptr, w1, xq, xscale, out1_dim, blocks_per_row);
+            sycl_matmul_q8_0_fused_pair_sg(*g_queue,
+                                            (float *)out0->ptr, (float *)out1->ptr,
+                                            w0, w1,
+                                            (const float *)x->ptr,
+                                            out0_dim, out1_dim,
+                                            blocks_per_row);
         }
         return 1;
     } catch (sycl::exception &e) {
@@ -2165,6 +2319,45 @@ extern "C" int ds4_gpu_repeat_hc_tensor(
 /* =========================================================================
  * RMS normalisation
  * ========================================================================= */
+extern "C" int ds4_gpu_rms_norm_plain_matmul_f16_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        float eps) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
+    if (weight_offset > model_size) return 0;
+    uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(sycl::half)) return 0;
+    uint64_t weight_bytes = weight_elems * sizeof(sycl::half);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < in_dim * sizeof(float) || out->bytes < out_dim * sizeof(float)) return 0;
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
+    if (!wptr) return 0;
+    const sycl::half *w = (const sycl::half *)wptr;
+    try {
+        g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
+            uint64_t o = (uint64_t)idx;
+            float sum_sq = 0.0f;
+            const float *xr = (const float *)x->ptr;
+            for (uint64_t i = 0; i < in_dim; i++) {
+                float v = xr[i];
+                sum_sq += v * v;
+            }
+            float scale = sycl::rsqrt(sum_sq / (float)in_dim + eps);
+            float sum = 0.0f;
+            for (uint64_t i = 0; i < in_dim; i++)
+                sum += (float)w[o * in_dim + i] * xr[i];
+            ((float *)out->ptr)[o] = sum * scale;
+        });
+        return 1;
+    } catch (sycl::exception &e) {
+        fprintf(stderr, "ds4: SYCL rms_norm_plain_matmul_f16 failed: %s\n", e.what());
+        return 0;
+    }
+}
+
 extern "C" int ds4_gpu_rms_norm_plain_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         uint32_t n, float eps) {

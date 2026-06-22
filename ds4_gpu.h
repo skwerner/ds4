@@ -315,6 +315,16 @@ int ds4_gpu_repeat_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_rms_norm_plain_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   eps);
+
 int ds4_gpu_rms_norm_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
