@@ -27,6 +27,23 @@ Wraps mmap pages directly as `MTLBuffer` objects — no copy at any point. Multi
 2. **USM host path** (current default): `sycl_model_range_ptr` allocates `sycl::malloc_host` buffers. These are pinned system RAM, accessible by both CPU and GPU. First layer does fresh allocations + CPU `memcpy`; subsequent layers reuse same buffers via a stale-cache mechanism (mark `offset=UINT64_MAX`, overwrite with `memcpy`). Total pinned footprint ~3.5 GiB (one layer of weights).
 3. **CPU pre-fault**: `madvise(MADV_POPULATE_READ)` at model load avoids ~300K page faults during Level Zero page-pinning (saves ~600 ms per cold copy).
 
+---
+
+## Queue Configuration & Submission Overhead
+
+The SYCL queue is configured with two properties:
+
+```cpp
+g_queue = new sycl::queue(*g_context, *g_device, ah,
+    sycl::property::queue::in_order{},
+    sycl::ext::oneapi::experimental::property::queue::immediate_command_list{});
+```
+
+- **`in_order`**: matches CUDA default stream semantics — commands execute in submission order without explicit dependencies.
+- **`immediate_command_list`**: Intel DPC++ extension that uses Level Zero immediate command lists (`zeCommandListCreateImmediate`) instead of the two-step "create command list → submit to queue" path. Each `submit()` call dispatches work directly to the GPU command processor, eliminating the driver-level batching handshake that cost ~1.7-2.1 ms per kernel in the default (non-immediate) path.
+
+Without immediate command lists, each `parallel_for` creates a command list, appends the kernel, submits the list to the queue, and synchronizes — a ~2.1 ms round trip entirely on the CPU side. Immediate mode bypasses the list creation and queue submission steps, pinning the bottleneck to the actual GPU dispatch latency (~tens of µs).
+
 ### Key differences
 - SYCL has no `cudaHostRegister` equivalent — USM `malloc_host` is the closest, but requires explicit `memcpy` to fill (zero-copy `cudaHostRegisterMapped` does not).
 - SYCL has no device-side VRAM cache for non-MoE weights (CUDA has `cuda_q8_f16_ranges` for dequantized weight caching).
@@ -140,7 +157,7 @@ The CPU-in-the-middle break prevents recording a single graph. The Level Zero im
 | No `ze_api.h` installed | `dlsym` runtime lookup from `libze_intel_gpu.so.1` |
 | No `cudaHostRegister` | `sycl::malloc_host` + explicit `memcpy` |
 | No tensor cores / WMMA | Sub-group `reduce_over_group()` for warp-level reduction |
-| Heavy submission overhead | Fused quantize+matmul kernels (3 variants) |
+| Heavy submission overhead | Fused quantize+matmul kernels (3 variants); Level Zero immediate command lists (`sycl::ext::oneapi::experimental::property::queue::immediate_command_list`) |
 | MoE CPU-readback blocks graphs | Level Zero import eliminates the dependency |
 | Async errors would terminate | Custom handler that logs and continues |
 

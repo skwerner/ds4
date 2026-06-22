@@ -1064,9 +1064,12 @@ extern "C" int ds4_gpu_init(void) {
                 }
             }
         };
-        /* In-order queue — matches CUDA default stream semantics */
+        /* In-order queue with Level Zero immediate command lists, to avoid
+         * the two-step "create command list → submit to queue" overhead that
+         * dominates per-kernel submission time (~2.1 ms). */
         g_queue   = new sycl::queue(*g_context, *g_device, ah,
-                                    sycl::property::queue::in_order{});
+                                    sycl::property::queue::in_order{},
+                                    sycl::ext::oneapi::experimental::property::queue::immediate_command_list{});
         g_initialized = 1;
         g_alloc_host = getenv("DS4_SYCL_ALLOC_HOST") != nullptr;
         if (g_alloc_host)
