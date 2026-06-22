@@ -23,6 +23,9 @@
 #include <chrono>
 #include <dlfcn.h>
 
+/* Forward declaration — defined after g_queue/g_alloc_host are set up. */
+static void *sycl_alloc_device(uint64_t bytes);
+
 #define DS4_SYCL_UNUSED __attribute__((unused))
 #define DS4_SYCL_MAX_STREAMS 4
 
@@ -223,8 +226,8 @@ static bool sycl_ensure_q8_bufs(uint64_t n_tok, uint64_t blocks_per_row) {
     if (cap32 <= g_q8_buf_cap) return true;
     if (g_q8_xq)     sycl::free(g_q8_xq, *g_queue);
     if (g_q8_xscale) sycl::free(g_q8_xscale, *g_queue);
-    g_q8_xq     = (int8_t  *)sycl::malloc_device(cap32 * 32, *g_queue);
-    g_q8_xscale = (float   *)sycl::malloc_device(cap32 * sizeof(float), *g_queue);
+    g_q8_xq     = (int8_t  *)sycl_alloc_device(cap32 * 32);
+    g_q8_xscale = (float   *)sycl_alloc_device(cap32 * sizeof(float));
     g_q8_buf_cap = cap32;
     return g_q8_xq && g_q8_xscale;
 }
@@ -234,7 +237,7 @@ static bool sycl_ensure_f16_buf(uint64_t n_tok, uint64_t in_dim) {
     uint64_t need = n_tok * in_dim;
     if (need <= g_f16_xh_cap) return true;
     if (g_f16_xh) sycl::free(g_f16_xh, *g_queue);
-    g_f16_xh = (sycl::half *)sycl::malloc_device(need * sizeof(sycl::half), *g_queue);
+    g_f16_xh = (sycl::half *)sycl_alloc_device(need * sizeof(sycl::half));
     g_f16_xh_cap = need;
     return g_f16_xh != nullptr;
 }
@@ -428,7 +431,7 @@ static int sycl_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t needed, const char *what) {
     if (*capacity >= needed) return 1;
     if (*ptr) sycl::free(*ptr, *g_context);
-    *ptr = (char *)sycl::malloc_device(needed, *g_queue);
+    *ptr = (char *)sycl_alloc_device(needed);
     if (!*ptr) {
         *capacity = 0;
         fprintf(stderr, "ds4: SYCL selected %s allocation failed (%llu bytes)\n",
@@ -443,7 +446,7 @@ static int sycl_stream_selected_ensure_i32(
         int32_t **ptr, uint64_t *capacity, uint64_t needed, const char *what) {
     if (*capacity >= needed) return 1;
     if (*ptr) sycl::free(*ptr, *g_context);
-    *ptr = (int32_t *)sycl::malloc_device(needed * sizeof(int32_t), *g_queue);
+    *ptr = (int32_t *)sycl_alloc_device(needed * sizeof(int32_t));
     if (!*ptr) {
         *capacity = 0;
         fprintf(stderr, "ds4: SYCL selected %s allocation failed (%llu elems)\n",
@@ -514,11 +517,11 @@ static int sycl_stream_expert_cache_try_alloc(
         uint64_t down_expert_bytes,
         char **gate_ptr, char **up_ptr, char **down_ptr,
         const char **alloc_error) {
-    *gate_ptr = (char *)sycl::malloc_device((uint64_t)cap * gate_expert_bytes, *g_queue);
+    *gate_ptr = (char *)sycl_alloc_device((uint64_t)cap * gate_expert_bytes);
     if (!*gate_ptr) { *alloc_error = "gate"; return 0; }
-    *up_ptr = (char *)sycl::malloc_device((uint64_t)cap * gate_expert_bytes, *g_queue);
+    *up_ptr = (char *)sycl_alloc_device((uint64_t)cap * gate_expert_bytes);
     if (!*up_ptr) { sycl::free(*gate_ptr, *g_context); *gate_ptr = nullptr; *alloc_error = "up"; return 0; }
-    *down_ptr = (char *)sycl::malloc_device((uint64_t)cap * down_expert_bytes, *g_queue);
+    *down_ptr = (char *)sycl_alloc_device((uint64_t)cap * down_expert_bytes);
     if (!*down_ptr) { sycl::free(*gate_ptr, *g_context); sycl::free(*up_ptr, *g_context); *gate_ptr = nullptr; *up_ptr = nullptr; *alloc_error = "down"; return 0; }
     *alloc_error = nullptr;
     return 1;
@@ -874,6 +877,20 @@ static char *moe_host_gate = nullptr, *moe_host_up = nullptr, *moe_host_down = n
 static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_bytes = 0;
 static bool g_model_imported = false;
 
+/* Integrated GPU mode flag — when set, all allocations use sycl::malloc_host
+ * instead of sycl::malloc_device.  Controlled by DS4_SYCL_ALLOC_HOST=1.
+ * On integrated GPUs (Meteor Lake, Lunar Lake, etc.) device memory is the
+ * same DRAM as host memory, so malloc_host avoids VRAM accounting issues and
+ * enables direct CPU access for debugging. */
+static int g_alloc_host = 0;
+
+/* Allocate device memory (or pinned host memory in integrated mode). */
+static void *sycl_alloc_device(uint64_t bytes) {
+    if (g_alloc_host)
+        return sycl::malloc_host(bytes, *g_queue);
+    return sycl::malloc_device(bytes, *g_queue);
+}
+
 /* =========================================================================
  * helpers: model range caching
  * ========================================================================= */
@@ -1051,6 +1068,9 @@ extern "C" int ds4_gpu_init(void) {
         g_queue   = new sycl::queue(*g_context, *g_device, ah,
                                     sycl::property::queue::in_order{});
         g_initialized = 1;
+        g_alloc_host = getenv("DS4_SYCL_ALLOC_HOST") != nullptr;
+        if (g_alloc_host)
+            fprintf(stderr, "ds4: SYCL using malloc_host for all allocations (integrated GPU mode)\n");
         fprintf(stderr, "ds4: SYCL backend initialized on %s\n",
                 d.get_info<sycl::info::device::name>().c_str());
         return 1;
@@ -1130,7 +1150,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return nullptr;
     try {
-        t->ptr = sycl::malloc_device(bytes, *g_queue);
+        t->ptr = sycl_alloc_device(bytes);
         if (!t->ptr) { free(t); return nullptr; }
     } catch (...) { free(t); return nullptr; }
     t->bytes = bytes;
@@ -1355,7 +1375,7 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
     /* Allocate + copy */
     try {
-        char *dptr = (char *)sycl::malloc_device(bytes, *g_queue);
+        char *dptr = (char *)sycl_alloc_device(bytes);
         if (!dptr) return 0;
         g_queue->memcpy(dptr, (const char *)model_map + offset, bytes);
         g_model_ranges.push_back({model_map, offset, bytes, dptr});
@@ -3950,8 +3970,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
        sycl::free which implicitly drains the queue). */
     uint64_t xq_bytes = n_tokens * blocks_a * 32;
     uint64_t xs_bytes = n_tokens * blocks_a * sizeof(float);
-    int8_t  *xq      = (int8_t  *)sycl::malloc_device(xq_bytes, *g_queue);
-    float   *xscale  = (float   *)sycl::malloc_device(xs_bytes, *g_queue);
+    int8_t  *xq      = (int8_t  *)sycl_alloc_device(xq_bytes);
+    float   *xscale  = (float   *)sycl_alloc_device(xs_bytes);
     if (!xq || !xscale) {
         sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
         return 0;
