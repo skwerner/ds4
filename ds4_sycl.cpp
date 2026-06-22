@@ -4304,35 +4304,51 @@ static int sycl_routed_moe_launch(
 
     /* Copy only the selected experts' weight blocks from mmap to host buffer.
      * Parallelized across all available hardware cores — each expert's three
-     * tensors are independent. */
+     * tensors are independent.  For small expert counts (decode path) a
+     * single-threaded loop avoids std::thread creation overhead (~7 ms vs
+     * ~0.1 ms for 6 experts). */
     const char *mmap = (const char *)model_map;
     {
-        /* Count selected experts and pack their indices. */
         uint32_t sel_count = 0;
         uint32_t sel_list[256];
         for (uint32_t e = 0; e < n_total_expert; e++)
             if (expert_used[e]) sel_list[sel_count++] = e;
 
-        uint32_t n_threads = (uint32_t)std::thread::hardware_concurrency();
-        if (n_threads < 1) n_threads = 1;
-        uint32_t chunk = (sel_count + n_threads - 1) / n_threads;
-        std::vector<std::thread> threads;
-        threads.reserve(n_threads);
-        for (uint32_t t = 0; t < n_threads && t * chunk < sel_count; t++) {
-            uint32_t start = t * chunk;
-            uint32_t end   = std::min(start + chunk, sel_count);
-            threads.emplace_back([=]() {
-                for (uint32_t i = start; i < end; i++) {
-                    uint32_t e = sel_list[i];
-                    uint64_t eo = (uint64_t)e * gate_expert_bytes;
-                    memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
-                    memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
-                    uint64_t edo = (uint64_t)e * down_expert_bytes;
-                    memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
-                }
-            });
+        if (sel_count <= 8) {
+            for (uint32_t i = 0; i < sel_count; i++) {
+                uint32_t e = sel_list[i];
+                uint64_t eo = (uint64_t)e * gate_expert_bytes;
+                memcpy(moe_host_gate + eo, mmap + gate_offset + eo, gate_expert_bytes);
+                memcpy(moe_host_up   + eo, mmap + up_offset   + eo, gate_expert_bytes);
+                uint64_t edo = (uint64_t)e * down_expert_bytes;
+                memcpy(moe_host_down + edo, mmap + down_offset + edo, down_expert_bytes);
+            }
+        } else {
+            uint32_t n_threads = (uint32_t)std::thread::hardware_concurrency();
+            if (n_threads < 1) n_threads = 1;
+            uint32_t chunk = (sel_count + n_threads - 1) / n_threads;
+            std::vector<std::thread> threads;
+            threads.reserve(n_threads);
+            for (uint32_t t = 0; t < n_threads && t * chunk < sel_count; t++) {
+                uint32_t start = t * chunk;
+                uint32_t end   = std::min(start + chunk, sel_count);
+                threads.emplace_back([=]() {
+                    const char *m = mmap;
+                    char *mg = moe_host_gate, *mu = moe_host_up, *md = moe_host_down;
+                    uint64_t go = gate_offset, uo = up_offset, ge = gate_expert_bytes;
+                    uint64_t de = down_expert_bytes, doff = down_offset;
+                    for (uint32_t i = start; i < end; i++) {
+                        uint32_t e = sel_list[i];
+                        uint64_t eo = (uint64_t)e * ge;
+                        memcpy(mg + eo, m + go + eo, ge);
+                        memcpy(mu + eo, m + uo + eo, ge);
+                        uint64_t edo = (uint64_t)e * de;
+                        memcpy(md + edo, m + doff + edo, de);
+                    }
+                });
+            }
+            for (auto &t : threads) t.join();
         }
-        for (auto &t : threads) t.join();
     }
 
     const char *gate_w = moe_host_gate;
