@@ -3442,7 +3442,10 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t raw_start, const ds4_gpu_tensor *comp_kv,
         uint32_t comp_kv_f16, uint32_t n_comp,
         const ds4_gpu_tensor *comp_mask, uint32_t use_mask,
-        uint32_t n_head, uint32_t head_dim) {
+        uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
     if (comp_kv_f16 || !heads || !q || !raw_kv || !model_map ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
@@ -3525,6 +3528,33 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                 if (use_mask) s += ((const float *)comp_mask->ptr)[i];
                 float w = sycl::exp(s - max_score) * inv_sum;
                 for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
+            }
+            if (n_rot > 0) {
+                uint32_t n_nope = head_dim - n_rot;
+                for (uint32_t p = 0; p < n_rot / 2; p++) {
+                    uint32_t i = p * 2;
+                    float theta_ext = (float)(pos0) * sycl::pow(freq_base, -(float)i / (float)n_rot);
+                    float theta_int = freq_scale * theta_ext;
+                    float theta_v = theta_int;
+                    float mscale_v = attn_factor;
+                    if (ext_factor != 0.0f) {
+                        float corr0 = sycl::floor((float)n_rot * sycl::log((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / (2.0f * sycl::log(freq_base)));
+                        float corr1 = sycl::ceil((float)n_rot * sycl::log((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / (2.0f * sycl::log(freq_base)));
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                        float ramp_mix = rope_yarn_ramp(corr0, corr1, (int)i) * ext_factor;
+                        theta_v = theta_int * (1.0f - ramp_mix) + theta_ext * ramp_mix;
+                        mscale_v *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                    }
+                    float c = sycl::cos(theta_v) * mscale_v;
+                    float s = sycl::sin(theta_v) * mscale_v;
+                    if (inverse) s = -s;
+                    float *tail = head_out + n_nope;
+                    float x0 = tail[i];
+                    float x1 = tail[i + 1];
+                    tail[i] = x0 * c - x1 * s;
+                    tail[i + 1] = x0 * s + x1 * c;
+                }
             }
         });
         return 1;
@@ -3828,7 +3858,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
         uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp,
         uint32_t top_k, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim) {
+        uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
     if (comp_kv_f16 || !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -3937,6 +3970,34 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     float s = dot * inv_scale;
                     float w = sycl::exp(s - max_score) * inv_sum;
                     for (uint32_t j = 0; j < head_dim; j++) head_out[j] += w * kv[j];
+                }
+            }
+            if (n_rot > 0) {
+                uint32_t n_nope = head_dim - n_rot;
+                uint32_t rpos = pos0 + t;
+                for (uint32_t pp = 0; pp < n_rot / 2; pp++) {
+                    uint32_t i = pp * 2;
+                    float theta_ext = (float)(rpos) * sycl::pow(freq_base, -(float)i / (float)n_rot);
+                    float theta_int = freq_scale * theta_ext;
+                    float theta_v = theta_int;
+                    float mscale_v = attn_factor;
+                    if (ext_factor != 0.0f) {
+                        float corr0 = sycl::floor((float)n_rot * sycl::log((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / (2.0f * sycl::log(freq_base)));
+                        float corr1 = sycl::ceil((float)n_rot * sycl::log((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / (2.0f * sycl::log(freq_base)));
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                        float ramp_mix = rope_yarn_ramp(corr0, corr1, (int)i) * ext_factor;
+                        theta_v = theta_int * (1.0f - ramp_mix) + theta_ext * ramp_mix;
+                        mscale_v *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                    }
+                    float c = sycl::cos(theta_v) * mscale_v;
+                    float s = sycl::sin(theta_v) * mscale_v;
+                    if (inverse) s = -s;
+                    float *tail = head_out + n_nope;
+                    float x0 = tail[i];
+                    float x1 = tail[i + 1];
+                    tail[i] = x0 * c - x1 * s;
+                    tail[i + 1] = x0 * s + x1 * c;
                 }
             }
         });

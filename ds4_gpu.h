@@ -605,7 +605,17 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -677,7 +687,16 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

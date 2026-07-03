@@ -15411,6 +15411,7 @@ static bool metal_graph_encode_decode_layer(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        const uint32_t rope_ctx = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
@@ -15432,7 +15433,16 @@ static bool metal_graph_encode_decode_layer(
                     g->raw_window,
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
-                    DS4_N_HEAD_DIM) != 0;
+                    DS4_N_HEAD_DIM,
+                    DS4_N_ROT,
+                    rope_ctx,
+                    true,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -15453,24 +15463,22 @@ static bool metal_graph_encode_decode_layer(
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                         DS4_N_ROT, pos,
+                                                         rope_ctx,
+                                                         true,
+                                                         freq_base,
+                                                         freq_scale,
+                                                         ext_factor,
+                                                         attn_factor,
+                                                         DS4_ROPE_YARN_BETA_FAST,
+                                                         DS4_ROPE_YARN_BETA_SLOW) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
-                                            1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
@@ -18421,6 +18429,7 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
+                    const uint32_t rope_ctx = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                               model->map,
                                                                               model->size,
@@ -18440,7 +18449,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              DS4_N_ROT,
+                                                                              rope_ctx,
+                                                                              true,
+                                                                              freq_base,
+                                                                              freq_scale,
+                                                                              ext_factor,
+                                                                              attn_factor,
+                                                                              DS4_ROPE_YARN_BETA_FAST,
+                                                                              DS4_ROPE_YARN_BETA_SLOW) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -18535,6 +18553,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
             }
             if (ok) {
+                const uint32_t rope_ctx = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
                 ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                           model->map,
                                                                           model->size,
@@ -18554,7 +18573,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->raw_window,
                                                                           ratio,
                                                                           DS4_N_HEAD,
-                                                                          DS4_N_HEAD_DIM) != 0;
+                                                                          DS4_N_HEAD_DIM,
+                                                                          DS4_N_ROT,
+                                                                          rope_ctx,
+                                                                          true,
+                                                                          freq_base,
+                                                                          freq_scale,
+                                                                          ext_factor,
+                                                                          attn_factor,
+                                                                          DS4_ROPE_YARN_BETA_FAST,
+                                                                          DS4_ROPE_YARN_BETA_SLOW) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -18662,6 +18690,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        DS4_N_HEAD_DIM) != 0;
                 }
                 if (ok && comp_mask != NULL && n_selected != 0) {
+                    const uint32_t rope_ctx = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,
                                                                               model->map,
                                                                               model->size,
@@ -18681,8 +18710,18 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              DS4_N_ROT,
+                                                                              rope_ctx,
+                                                                              true,
+                                                                              freq_base,
+                                                                              freq_scale,
+                                                                              ext_factor,
+                                                                              attn_factor,
+                                                                              DS4_ROPE_YARN_BETA_FAST,
+                                                                              DS4_ROPE_YARN_BETA_SLOW) != 0;
                 } else if (ok) {
+                    const uint32_t rope_ctx = compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0;
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
                                                                  model->size,
@@ -18698,7 +18737,17 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  comp_mask,
                                                                  n_selected,
                                                                  DS4_N_HEAD,
-                                                                 DS4_N_HEAD_DIM) != 0;
+                                                                 DS4_N_HEAD_DIM,
+                                                                 DS4_N_ROT,
+                                                                 pos,
+                                                                 rope_ctx,
+                                                                 true,
+                                                                 freq_base,
+                                                                 freq_scale,
+                                                                 ext_factor,
+                                                                 attn_factor,
+                                                                 DS4_ROPE_YARN_BETA_FAST,
+                                                                 DS4_ROPE_YARN_BETA_SLOW) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);
@@ -18712,20 +18761,6 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
-                                            n_tokens,
-                                            DS4_N_HEAD,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);

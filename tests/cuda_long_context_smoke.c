@@ -127,11 +127,21 @@ static int check_decode_attention_overflow_path(void) {
                                               comp,
                                               0,
                                               n_comp,
-                                              NULL,
-                                              0,
-                                              n_head,
-                                              head_dim) &&
-        ds4_gpu_synchronize() &&
+                                               NULL,
+                                               0,
+                                               n_head,
+                                               head_dim,
+                                               0,
+                                               0,
+                                               0,
+                                               false,
+                                               0.0f,
+                                               0.0f,
+                                               0.0f,
+                                               0.0f,
+                                               0.0f,
+                                               0.0f) &&
+         ds4_gpu_synchronize() &&
         ds4_gpu_tensor_read(heads, 0, heads_host, q_count * sizeof(float))) {
         rc = 0;
         for (uint32_t h = 0; h < n_head; h++) {
