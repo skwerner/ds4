@@ -1,0 +1,5 @@
+from "./gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
+
+license "CC-BY-4.0"
+
+message system "DeepSeek V4 Flash (local gguf)"

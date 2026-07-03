@@ -877,6 +877,33 @@ static char *moe_host_gate = nullptr, *moe_host_up = nullptr, *moe_host_down = n
 static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_bytes = 0;
 static bool g_model_imported = false;
 
+/* Reusable buffer pool — eliminates munmap + re-mmap per layer.
+ * All allocation paths check this pool before calling sycl::malloc_*:
+ *   - sycl_alloc_device() for device/host scratch buffers
+ *   - ds4_gpu_tensor_alloc() for per-layer tensors
+ *   - ds4_gpu_tensor_alloc_managed() for shared tensors
+ * The in-order queue guarantees no GPU reads the buffer after the
+ * layer's wait() before the next layer reuses it. */
+enum { POOL_DEVICE = 0, POOL_SHARED = 1 };
+struct pool_buf {
+    void     *ptr;
+    uint64_t  bytes;
+    int       type;    /* POOL_DEVICE = sycl::malloc_device, POOL_SHARED = sycl::malloc_shared */
+    bool      in_use;
+};
+static std::vector<pool_buf> g_alloc_pool;
+
+/* Register a new allocation in the pool. */
+static void pool_register(void *ptr, uint64_t bytes, int type) {
+    g_alloc_pool.push_back({ptr, bytes, type, true});
+}
+/* Return a buffer to the pool.  Returns true if found, false if unknown. */
+static bool pool_return(void *ptr) {
+    for (auto &b : g_alloc_pool)
+        if (b.ptr == ptr) { b.in_use = false; return true; }
+    return false;
+}
+
 /* Integrated GPU mode flag — when set, all allocations use sycl::malloc_host
  * instead of sycl::malloc_device.  Controlled by DS4_SYCL_ALLOC_HOST=1.
  * On integrated GPUs (Meteor Lake, Lunar Lake, etc.) device memory is the
@@ -1117,18 +1144,28 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_registered_size = 0;
     g_model_registered      = 0;
 
+    /* Drain the buffer reuse pool before individual sycl::free calls —
+     * pool-registered buffers are freed here and their globals are
+     * nulled to prevent double-free by the legacy cleanup below. */
+    for (auto &b : g_alloc_pool)
+        if (b.ptr) sycl::free(b.ptr, *g_queue);
+    g_alloc_pool.clear();
+
+    /* Null out pointers that were pool-registered so the legacy
+     * sycl::free calls below are no-ops (they free via pointer, not name). */
+    g_q8_xq = nullptr; g_q8_xscale = nullptr; g_q8_buf_cap = 0;
+    g_f16_xh = nullptr; g_f16_xh_cap = 0;
+    moe_host_gate = moe_host_up = moe_host_down = nullptr;
+    moe_host_gate_bytes = moe_host_up_bytes = moe_host_down_bytes = 0;
+
     if (g_q8_xq)     sycl::free(g_q8_xq, *g_queue);
     if (g_q8_xscale) sycl::free(g_q8_xscale, *g_queue);
-    g_q8_xq = nullptr; g_q8_xscale = nullptr; g_q8_buf_cap = 0;
 
     if (g_f16_xh)    sycl::free(g_f16_xh, *g_queue);
-    g_f16_xh = nullptr; g_f16_xh_cap = 0;
 
     if (moe_host_gate)   sycl::free(moe_host_gate, *g_queue);
     if (moe_host_up)     sycl::free(moe_host_up, *g_queue);
     if (moe_host_down)   sycl::free(moe_host_down, *g_queue);
-    moe_host_gate = moe_host_up = moe_host_down = nullptr;
-    moe_host_gate_bytes = moe_host_up_bytes = moe_host_down_bytes = 0;
 
     sycl_stream_selected_cache_release_all();
     sycl_stream_expert_cache_release_all();
@@ -1154,6 +1191,19 @@ extern "C" uint64_t ds4_gpu_vram_total(void) {
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_queue) return nullptr;
     if (bytes == 0) bytes = 1;
+    /* Attempt 1: reuse a pooled buffer of the same size. */
+    for (auto &b : g_alloc_pool) {
+        if (!b.in_use && b.bytes == bytes && b.type == POOL_DEVICE) {
+            b.in_use = true;
+            ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+            if (!t) return nullptr;
+            t->ptr   = b.ptr;
+            t->bytes = bytes;
+            t->owner = 1;
+            return t;
+        }
+    }
+    /* Attempt 2: fresh allocation (first layer only per size). */
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return nullptr;
     try {
@@ -1162,13 +1212,26 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     } catch (...) { free(t); return nullptr; }
     t->bytes = bytes;
     t->owner = 1;
+    g_alloc_pool.push_back({t->ptr, bytes, POOL_DEVICE, true});
     return t;
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
-    /* Managed memory fallback: use host shared memory via malloc_host */
     if (!g_queue) return nullptr;
     if (bytes == 0) bytes = 1;
+    /* Attempt 1: reuse a pooled buffer of the same size. */
+    for (auto &b : g_alloc_pool) {
+        if (!b.in_use && b.bytes == bytes && b.type == POOL_SHARED) {
+            b.in_use = true;
+            ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+            if (!t) return nullptr;
+            t->ptr   = b.ptr;
+            t->bytes = bytes;
+            t->owner = 1;
+            return t;
+        }
+    }
+    /* Attempt 2: fresh allocation (first layer only per size). */
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return nullptr;
     try {
@@ -1177,6 +1240,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     } catch (...) { free(t); return nullptr; }
     t->bytes = bytes;
     t->owner = 1;
+    g_alloc_pool.push_back({t->ptr, bytes, POOL_SHARED, true});
     return t;
 }
 
@@ -1193,8 +1257,16 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr && g_queue) {
-        sycl::free(tensor->ptr, *g_queue);
+    if (tensor->owner && tensor->ptr) {
+        for (auto &b : g_alloc_pool) {
+            if (b.ptr == tensor->ptr) {
+                b.in_use = false;
+                free(tensor);
+                return;
+            }
+        }
+        /* Not in pool — free directly (e.g. model range buffers). */
+        if (g_queue) sycl::free(tensor->ptr, *g_queue);
     }
     free(tensor);
 }
@@ -3973,92 +4045,79 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) return 0;
 
-    /* Pre-allocate device buffers reused across all groups (avoids per-group
-       sycl::free which implicitly drains the queue). */
-    uint64_t xq_bytes = n_tokens * blocks_a * 32;
-    uint64_t xs_bytes = n_tokens * blocks_a * sizeof(float);
-    int8_t  *xq      = (int8_t  *)sycl_alloc_device(xq_bytes);
-    float   *xscale  = (float   *)sycl_alloc_device(xs_bytes);
-    if (!xq || !xscale) {
-        sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
-        return 0;
-    }
+    /* Fused kernel: all groups in a single submission, no per-group loop.
+       Replaces (n_groups × 2) submissions — saves 15 submits for 8 groups.
+       Each work-group handles 16 rows of rank for a (tok, group) pair.
+       16 lanes cooperate across blocks_a blocks, reading heads input
+       directly and quantizing on-the-fly — no intermediate xq/xscale buffer. */
+    try {
+        const char *wa_base = sycl_model_range_ptr(model_map, out_a_offset,
+            out_a_bytes, "attn_out_a_fused");
+        if (!wa_base) return 0;
+        const uint8_t *wa = (const uint8_t *)wa_base;
+        const float *h_ptr = (const float *)heads->ptr;
+        float *l_ptr = (float *)low->ptr;
 
-    for (uint32_t g = 0; g < n_groups; g++) {
-        uint64_t group_offset = out_a_offset + (uint64_t)g * rank * blocks_a * 34;
-        /* Build views: heads[:,g,:] is non-contiguous (strided by n_groups).
-           Pre-quantize into a contiguous temp buffer for batch matmul. */
-        try {
-            /* Quantize: strided read from heads[:,g,:] into contiguous xq/xscale */
-            g_queue->submit([&](sycl::handler &h) {
-                h.parallel_for(sycl::range<2>(blocks_a, n_tokens), [=](sycl::id<2> idx) {
-                    uint32_t b = idx[0], t = idx[1];
-                    const float *row = (const float *)heads->ptr +
-                        ((uint64_t)t * n_groups + g) * group_dim + (uint64_t)b * 32;
-                    int8_t *xq_row = xq + ((uint64_t)t * blocks_a + b) * 32;
+        g_queue->submit([=](sycl::handler &h) {
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(16 * ((rank + 15) / 16), n_tokens * n_groups),
+                sycl::range<2>(16, 1)), [=](sycl::nd_item<2> item) {
+                uint64_t row_base = (uint64_t)item.get_group(0) * 16;
+                uint64_t flat = (uint64_t)item.get_group(1);
+                uint64_t tok = flat / n_groups;
+                uint64_t g = flat % n_groups;
+                uint64_t sg_id = item.get_sub_group().get_group_id();
+                uint64_t row = row_base + sg_id;
+                if (row >= rank) return;
+
+                auto sg = item.get_sub_group();
+                uint32_t lane = sg.get_local_id();
+                const float *h_base = h_ptr +
+                    ((uint64_t)tok * n_groups + g) * group_dim;
+                const uint8_t *w_row = wa +
+                    (g * rank + row) * blocks_a * 34;
+
+                float acc = 0.0f;
+                for (uint64_t b = lane; b < blocks_a; b += 16) {
+                    /* Inline quantize: 32 floats -> (scale, int8) */
                     float maxv = 0.0f;
+                    float vbuf[32];
                     for (int i = 0; i < 32; i++) {
-                        float v = row[i];
+                        float v = h_base[b * 32 + i];
+                        vbuf[i] = v;
                         if (v > maxv) maxv = v;
                         if (-v > maxv) maxv = -v;
                     }
                     float d = maxv / 127.0f;
                     if (d == 0.0f) d = 1.0f;
-                    xscale[t * blocks_a + b] = d;
+                    int8_t xqb[32];
                     for (int i = 0; i < 32; i++) {
-                        xq_row[i] = (int8_t)(row[i] / d);
+                        xqb[i] = (int8_t)(vbuf[i] / d);
                     }
-                });
-            });
-            /* Batch Q8_0 matmul: all tokens at once for this group */
-            const char *wa_ptr = sycl_model_range_ptr(model_map, group_offset,
-                rank * blocks_a * 34, "attn_out_a");
-            if (!wa_ptr) { sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue); return 0; }
-            const uint8_t *w8_const = (const uint8_t *)wa_ptr;
-            g_queue->submit([=](sycl::handler &h) {
-                h.parallel_for(sycl::nd_range<2>(
-                    sycl::range<2>(16 * ((rank + 15) / 16), n_tokens),
-                    sycl::range<2>(16, 1)), [=](sycl::nd_item<2> item) {
-                    uint64_t row_base = (uint64_t)item.get_group(0) * 16;
-                    uint64_t tok = (uint64_t)item.get_group(1);
-                    uint64_t sg_id = item.get_sub_group().get_group_id();
-                    uint64_t row = row_base + sg_id;
-                    if (row >= rank) return;
 
-                    auto sg = item.get_sub_group();
-                    uint32_t lane = sg.get_local_id();
-                    const int8_t *xqr = xq + tok * blocks_a * 32;
-                    const float *xsr = xscale + tok * blocks_a;
-                    float acc = 0.0f;
-                    for (uint64_t b = lane; b < blocks_a; b += 16) {
-                        const uint8_t *block = w8_const + (row * blocks_a + b) * 34;
-                        uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
-                        float wscale = sycl_half_to_float(d_bits);
-                        const int8_t *wq = (const int8_t *)(block + 2);
-                        const int8_t *xqb = xqr + b * 32;
-                        int dot = 0;
+                    /* Weight block */
+                    uint16_t d_bits = (uint16_t)w_row[b * 34] |
+                        ((uint16_t)w_row[b * 34 + 1] << 8);
+                    float wscale = sycl_half_to_float(d_bits);
+                    const int8_t *wq = (const int8_t *)(w_row + b * 34 + 2);
+
+                    int dot = 0;
 #pragma unroll
-                        for (int i = 0; i < 32; i++) dot += (int)wq[i] * (int)xqb[i];
-                        acc += wscale * xsr[b] * (float)dot;
-                    }
-                    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-                    if (lane == 0) {
-                        float *low_out = (float *)low->ptr +
-                            ((uint64_t)tok * n_groups + g) * rank + row;
-                        *low_out = acc;
-                    }
-                });
+                    for (int i = 0; i < 32; i++) dot += (int)wq[i] * (int)xqb[i];
+                    acc += wscale * d * (float)dot;
+                }
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0) {
+                    l_ptr[((uint64_t)tok * n_groups + g) * rank + row] = acc;
+                }
             });
-        } catch (sycl::exception &e) {
-            fprintf(stderr, "ds4: SYCL attention_output_q8_batch project A failed: %s\n", e.what());
-            sycl::free(xq, *g_queue); sycl::free(xscale, *g_queue);
-            return 0;
-        }
+        });
+    } catch (sycl::exception &e) {
+        fprintf(stderr, "ds4: SYCL attention_output fused A failed: %s\n", e.what());
+        return 0;
     }
-    sycl::free(xq, *g_queue);
-    sycl::free(xscale, *g_queue);
 
-    /* Project B: low @ out_b^T -> out (single Q8 matmul) */
+    /* Project B: low @ out_b^T -> out (single Q8 matmul, unchanged) */
     return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
                                        out_b_offset, low_dim, out_dim,
                                        low, n_tokens);
@@ -4090,15 +4149,69 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         heads->bytes < (uint64_t)n_groups * group_dim * sizeof(float) ||
         low->bytes < low_dim * sizeof(float))
         return 0;
-    for (uint32_t g = 0; g < n_groups; g++) {
-        uint64_t group_offset = out_a_offset + (uint64_t)g * rank * blocks_a * 34;
-        ds4_gpu_tensor head_view = { (char *)heads->ptr + (uint64_t)g * group_dim * sizeof(float),
-                                     group_dim * sizeof(float), 0 };
-        ds4_gpu_tensor low_view = { (char *)low->ptr + (uint64_t)g * rank * sizeof(float),
-                                    rank * sizeof(float), 0 };
-        if (!ds4_gpu_matmul_q8_0_tensor(&low_view, model_map, model_size,
-                                         group_offset, group_dim, rank,
-                                         &head_view, 1)) return 0;
+
+    /* Fused kernel: all groups in a single submission.
+       Replaces 8 per-group submissions with 1 fused kernel. */
+    try {
+        const char *wa_base = sycl_model_range_ptr(model_map, out_a_offset,
+            out_a_bytes, "attn_out_low_fused");
+        if (!wa_base) return 0;
+        const uint8_t *wa = (const uint8_t *)wa_base;
+        const float *h_ptr = (const float *)heads->ptr;
+        float *l_ptr = (float *)low->ptr;
+
+        g_queue->submit([=](sycl::handler &h) {
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(16 * ((rank + 15) / 16), n_groups),
+                sycl::range<2>(16, 1)), [=](sycl::nd_item<2> item) {
+                uint64_t row_base = (uint64_t)item.get_group(0) * 16;
+                uint64_t g = (uint64_t)item.get_group(1);
+                uint64_t sg_id = item.get_sub_group().get_group_id();
+                uint64_t row = row_base + sg_id;
+                if (row >= rank) return;
+
+                auto sg = item.get_sub_group();
+                uint32_t lane = sg.get_local_id();
+                const float *h_base = h_ptr + (uint64_t)g * group_dim;
+                const uint8_t *w_row = wa +
+                    (g * rank + row) * blocks_a * 34;
+
+                float acc = 0.0f;
+                for (uint64_t b = lane; b < blocks_a; b += 16) {
+                    float maxv = 0.0f;
+                    float vbuf[32];
+                    for (int i = 0; i < 32; i++) {
+                        float v = h_base[b * 32 + i];
+                        vbuf[i] = v;
+                        if (v > maxv) maxv = v;
+                        if (-v > maxv) maxv = -v;
+                    }
+                    float d = maxv / 127.0f;
+                    if (d == 0.0f) d = 1.0f;
+                    int8_t xqb[32];
+                    for (int i = 0; i < 32; i++) {
+                        xqb[i] = (int8_t)(vbuf[i] / d);
+                    }
+
+                    uint16_t d_bits = (uint16_t)w_row[b * 34] |
+                        ((uint16_t)w_row[b * 34 + 1] << 8);
+                    float wscale = sycl_half_to_float(d_bits);
+                    const int8_t *wq = (const int8_t *)(w_row + b * 34 + 2);
+
+                    int dot = 0;
+#pragma unroll
+                    for (int i = 0; i < 32; i++) dot += (int)wq[i] * (int)xqb[i];
+                    acc += wscale * d * (float)dot;
+                }
+                acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+                if (lane == 0) {
+                    l_ptr[(uint64_t)g * rank + row] = acc;
+                }
+            });
+        });
+    } catch (sycl::exception &e) {
+        fprintf(stderr, "ds4: SYCL attention_output_low fused failed: %s\n", e.what());
+        return 0;
     }
     return 1;
 }

@@ -1,0 +1,11 @@
+194 [131188786194112] INFO mrtehelpers.mrteenv <> - Product libs directory: /opt/intel/oneapi/vtune/2026.2/lib64
+194 [131188786194112] INFO mrtehelpers.mrteenv <> - File mask: amplxe_samplingmrte_clrprof*
+217 [131188786194112] INFO mrtehelpers.mrteenv <> - File name: libamplxe_samplingmrte_clrprof_1.0.so
+1997 [131188299658944] INFO mrtehelpers.attach <> - pid=272356
+1997 [131188299658944] INFO mrtehelpers.attach <> - baseName=samplingmrte
+1997 [131188299658944] INFO mrtehelpers.attach <> - dataDir=/home/stefan/ds4/r000hs/data.0/
+2013 [131188299658944] ERROR mrtehelpers.attach <> - Failed to match pattern (\S+libjvm\.so), at file: vcs/mrtehelpers3/src/common/utils.cpp:1071
+2013 [131188299658944] ERROR mrtehelpers.attach <> - Not found libjvm, at file: vcs/mrtehelpers3/src/common/utils.cpp:1110
+2013 [131188299658944] ERROR mrtehelpers.attach <> - Java exe path is empty, at file: vcs/mrtehelpers3/src/common/utils.cpp:1481
+2038 [131188299658944] ERROR mrtehelpers.attach <> - Error accessing the socket, at file: vcs/mrtehelpers3/src/common/utils.cpp:1018
+2038 [131188299658944] ERROR mrtehelpers.attach <> - The specified process doesn't have diagnostics pipe, attach is impossible, at file: vcs/mrtehelpers3/src/attach/attach_mrte_profiler.cpp:117
