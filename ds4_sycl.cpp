@@ -2316,18 +2316,120 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
     return 0;
 }
 
+/* Fused gate+up matmul + SwiGLU in one submission.
+   Replaces pair_tensor (1 sub) + swiglu_tensor (1 sub) with 1 fused kernel.
+   Reads x once, quantizes on-the-fly, computes gate=W_gate@x and up=W_up@x
+   for every output row, then immediately writes mid=SiLU(gate)*up. */
+static void sycl_matmul_q8_0_fused_pair_swiglu_sg(sycl::queue &q,
+                                                    float *gate_out,
+                                                    float *up_out,
+                                                    float *mid_out,
+                                                    const uint8_t *w_gate,
+                                                    const uint8_t *w_up,
+                                                    const float *x,
+                                                    uint64_t out_dim,
+                                                    uint64_t blocks_per_row,
+                                                    float clamp) {
+    sycl::range<1> global(round_up(out_dim, 8) * 16);
+    sycl::range<1> local(128);
+    q.parallel_for(sycl::nd_range<1>(global, local), [=](sycl::nd_item<1> item) {
+        uint64_t row = (uint64_t)item.get_global_id(0) / 16;
+        if (row >= out_dim) return;
+        auto sg = item.get_sub_group();
+        uint32_t lane = sg.get_local_id();
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (uint64_t b = lane; b < blocks_per_row; b += 16) {
+            float vals[32];
+            for (int i = 0; i < 32; i++) vals[i] = x[b * 32 + i];
+            float amax = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                float v = vals[i] < 0 ? -vals[i] : vals[i];
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+            /* Gate */
+            {
+                const uint8_t *block = w_gate + (row * blocks_per_row + b) * 34;
+                uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+                float wscale = sycl_half_to_float(d_bits);
+                const int8_t *wq = (const int8_t *)(block + 2);
+                int dot = 0;
+                for (int i = 0; i < 32; i++) {
+                    float scaled = vals[i] * id;
+                    int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) qv = 127;
+                    else if (qv < -128) qv = -128;
+                    dot += (int)wq[i] * qv;
+                }
+                acc0 += wscale * d * (float)dot;
+            }
+            /* Up */
+            {
+                const uint8_t *block = w_up + (row * blocks_per_row + b) * 34;
+                uint16_t d_bits = (uint16_t)block[0] | ((uint16_t)block[1] << 8);
+                float wscale = sycl_half_to_float(d_bits);
+                const int8_t *wq = (const int8_t *)(block + 2);
+                int dot = 0;
+                for (int i = 0; i < 32; i++) {
+                    float scaled = vals[i] * id;
+                    int qv = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+                    if (qv > 127) qv = 127;
+                    else if (qv < -128) qv = -128;
+                    dot += (int)wq[i] * qv;
+                }
+                acc1 += wscale * d * (float)dot;
+            }
+        }
+        acc0 = sycl::reduce_over_group(sg, acc0, sycl::plus<float>());
+        if (lane == 0) gate_out[row] = acc0;
+        acc1 = sycl::reduce_over_group(sg, acc1, sycl::plus<float>());
+        if (lane == 0) up_out[row] = acc1;
+
+        /* SwiGLU: mid = SiLU(gate) * up */
+        float g = acc0 / (1.0f + sycl::exp(-acc0));
+        if (clamp > 1.0e-6f) {
+            g = sycl::fmin(g, clamp);
+            acc1 = sycl::fmin(sycl::fmax(acc1, -clamp), clamp);
+        }
+        if (lane == 0) mid_out[row] = g * acc1;
+    });
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset,
         uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, float clamp) {
-    return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
-                                             model_map, model_size,
-                                             gate_offset, up_offset,
-                                             in_dim, out_dim, out_dim,
-                                             x, 1) &&
-           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
+    if (!gate || !up || !mid || !model_map || !x ||
+        in_dim == 0 || out_dim == 0) return 0;
+    uint64_t blocks_per_row = (in_dim + 31) / 32;
+    uint64_t weight_bytes = out_dim * blocks_per_row * 34;
+    if (gate_offset > model_size || up_offset > model_size ||
+        weight_bytes > model_size - gate_offset ||
+        weight_bytes > model_size - up_offset) return 0;
+    if (x->bytes < in_dim * sizeof(float) ||
+        gate->bytes < out_dim * sizeof(float) ||
+        up->bytes < out_dim * sizeof(float) ||
+        mid->bytes < out_dim * sizeof(float)) return 0;
+    try {
+        const char *w_gate_ptr = sycl_model_range_ptr(model_map, gate_offset,
+            weight_bytes, "gate_swiglu");
+        const char *w_up_ptr = sycl_model_range_ptr(model_map, up_offset,
+            weight_bytes, "up_swiglu");
+        if (!w_gate_ptr || !w_up_ptr) return 0;
+        sycl_matmul_q8_0_fused_pair_swiglu_sg(*g_queue,
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+            (const uint8_t *)w_gate_ptr, (const uint8_t *)w_up_ptr,
+            (const float *)x->ptr,
+            out_dim, blocks_per_row, clamp);
+        return 1;
+    } catch (sycl::exception &e) {
+        fprintf(stderr, "ds4: SYCL shared_gate_up_swiglu failed: %s\n", e.what());
+        return 0;
+    }
 }
 
 extern "C" int ds4_gpu_matmul_f16_tensor(
@@ -2384,6 +2486,42 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out_a || !out_b || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (weight_a_offset > model_size || weight_b_offset > model_size) return 0;
+    uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(sycl::half)) return 0;
+    uint64_t weight_bytes = weight_elems * sizeof(sycl::half);
+    if (weight_bytes > model_size - weight_a_offset ||
+        weight_bytes > model_size - weight_b_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out_a->bytes < n_tok * out_dim * sizeof(float) ||
+        out_b->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    /* Fused pair kernel for decode (n_tok=1): reads x once, computes
+       both out_a = Wa @ x and out_b = Wb @ x in 1 submission. */
+    if (n_tok == 1) {
+        try {
+            const char *wptr_a = sycl_model_range_ptr(model_map, weight_a_offset, weight_bytes, "f16");
+            const char *wptr_b = sycl_model_range_ptr(model_map, weight_b_offset, weight_bytes, "f16");
+            if (!wptr_a || !wptr_b) return 0;
+            const sycl::half *wa = (const sycl::half *)wptr_a;
+            const sycl::half *wb = (const sycl::half *)wptr_b;
+            g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
+                uint64_t o = (uint64_t)idx;
+                float sum_a = 0.0f, sum_b = 0.0f;
+                for (uint64_t i = 0; i < in_dim; i++) {
+                    float xi = ((const float *)x->ptr)[i];
+                    sum_a += (float)wa[o * in_dim + i] * xi;
+                    sum_b += (float)wb[o * in_dim + i] * xi;
+                }
+                ((float *)out_a->ptr)[o] = sum_a;
+                ((float *)out_b->ptr)[o] = sum_b;
+            });
+            return 1;
+        } catch (sycl::exception &e) {
+            fprintf(stderr, "ds4: SYCL matmul_f16_pair decode failed: %s\n", e.what());
+            return 0;
+        }
+    }
+    /* Batch (n_tok > 1): fall back to separate oneMKL gemm calls */
     return ds4_gpu_matmul_f16_tensor(out_a, model_map, model_size, weight_a_offset,
                                       in_dim, out_dim, x, n_tok) &&
            ds4_gpu_matmul_f16_tensor(out_b, model_map, model_size, weight_b_offset,
