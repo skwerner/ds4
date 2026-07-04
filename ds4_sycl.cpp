@@ -22,6 +22,7 @@
 #include <mutex>
 #include <chrono>
 #include <dlfcn.h>
+#include <level_zero/ze_api.h>
 
 /* Forward declaration — defined after g_queue/g_alloc_host are set up. */
 static void *sycl_alloc_device(uint64_t bytes);
@@ -875,7 +876,12 @@ static int sycl_stream_selected_cache_begin_compact_load(
 
 static char *moe_host_gate = nullptr, *moe_host_up = nullptr, *moe_host_down = nullptr;
 static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_bytes = 0;
-static bool g_model_imported = false;
+
+/* Bulk model copy: if we can allocate a single malloc_host buffer for the entire
+ * model size and memcpy the mmap into it once, all per-range copies are eliminated.
+ * sycl_model_range_ptr returns g_model_host_ptr + offset directly — no cache,
+ * no mutex, no per-layer memcpy.  Falls back to per-range cache on failure. */
+static char *g_model_host_ptr = nullptr;
 
 /* Reusable buffer pool — eliminates munmap + re-mmap per layer.
  * All allocation paths check this pool before calling sycl::malloc_*:
@@ -949,23 +955,54 @@ static std::mutex                    g_model_ranges_mutex;
  * New host allocations happen only for the first layer.  After that, every
  * weight finds either an exact match or an available same-size buffer to
  * reuse — no further allocation cost. */
+/* Forward declaration — defined later in the file. */
+extern "C" void ds4_gpu_cleanup_cached_model_ranges(void);
+
 static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     static int prof_map = -1;
     if (prof_map < 0) prof_map = getenv("DS4_SYCL_PROFILE_MAP") != nullptr;
-    auto t0 = std::chrono::steady_clock::now();
     if (!g_queue) return nullptr;
-    if (bytes == 0 || g_model_imported) return (const char *)model_map + offset;
+    if (bytes == 0) return (const char *)model_map + offset;
+
+    /* Bulk fast path: entire model is in one malloc_host buffer — return + offset. */
+    if (g_model_host_ptr)
+        return g_model_host_ptr + offset;
+
+    /* Lazy bulk allocation: on first call with a valid queue, try to grab
+     * the full model size as a single USM host allocation.  On a 292 GiB
+     * system the A750 driver allows large zeMemAllocHost requests through
+     * DRM GEM bo creation (no RLIMIT_MEMLOCK).  If it fails (fragmentation
+     * or driver limits), fall back to per-range caching below. */
+    if (g_model_host_base && g_model_registered_size > 0) {
+        auto t_bulk = std::chrono::steady_clock::now();
+        try {
+            char *bulk = (char *)sycl::malloc_host(g_model_registered_size, g_queue->get_context());
+            if (bulk) {
+                memcpy(bulk, g_model_host_base, g_model_registered_size);
+                double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_bulk).count();
+                fprintf(stderr, "ds4: bulk model copy %llu MiB in %.0f ms (%.0f MiB/s)\n",
+                        (unsigned long long)(g_model_registered_size >> 20), ms,
+                        (g_model_registered_size / 1048576.0) / (ms / 1000.0));
+                g_model_host_ptr = bulk;
+                /* Per-range cache is no longer needed — free all entries. */
+                ds4_gpu_cleanup_cached_model_ranges();
+                return g_model_host_ptr + offset;
+            }
+        } catch (...) {}
+        if (!g_model_host_ptr)
+            fprintf(stderr, "ds4: bulk malloc_host(%llu) failed — using per-range cache\n",
+                    (unsigned long long)g_model_registered_size);
+    }
+
+    /* Per-range caching fallback. */
+    auto t0 = std::chrono::steady_clock::now();
     bool is_expert = (what[0] == 'm' && what[1] == 'o' && what[2] == 'e' && what[3] == '_');
     {
-        /* Attempt 1: exact match (same host_base + offset + bytes). */
         std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
         for (auto &r : g_model_ranges) {
-            if (r.host_base == model_map && offset >= r.offset && offset + bytes <= r.offset + r.bytes) {
+            if (r.host_base == model_map && offset >= r.offset && offset + bytes <= r.offset + r.bytes)
                 return r.device_ptr + (offset - r.offset);
-            }
         }
-        /* Attempt 2: stale reuse — same bytes, marked available.  Overwrite
-         * with CPU memcpy (pre-pinned host buffer → no DMA submit overhead). */
         for (auto &r : g_model_ranges) {
             if (r.host_base == model_map && r.bytes == bytes && r.offset == UINT64_MAX && r.device_ptr) {
                 const char *src = (const char *)model_map + offset;
@@ -975,7 +1012,6 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
             }
         }
     }
-    /* Attempt 3: fresh allocation (first layer only for any given size). */
     try {
         auto t_alloc = std::chrono::steady_clock::now();
         char *dptr = (char *)sycl::malloc_host(bytes, g_queue->get_context());
@@ -1017,40 +1053,10 @@ extern "C" void ds4_gpu_prepare_model_memory(const void *model_map, uint64_t mod
     (void)sink;
 #endif
 
-    /* Try to import model mmap as Level Zero external memory, enabling direct
-     * GPU access without CPU memcpy. zexDriverImportExternalPointer tells the
-     * Intel GPU driver to pin the mmap pages and expose them to the DMA engine.
-     * Falls back to CPU copy path if the extension is unavailable or fails.
-     * Note: this runs before ds4_gpu_init, so we create a temporary device
-     * instead of using g_queue. */
-    try {
-        sycl::device tmp_dev(sycl::gpu_selector_v);
-        auto platform = tmp_dev.get_platform();
-        auto ze_driver = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(platform);
-        /* Look up zexDriverImportExternalPointer via dlsym from the already-
-         * loaded libze_intel_gpu.so (loaded as a dependency of libze_loader). */
-        void *handle = dlopen("libze_intel_gpu.so.1", RTLD_NOLOAD | RTLD_LAZY);
-        if (handle) {
-            using import_fn_t = int32_t (*)(void *, void *, size_t);
-            auto import_fn = (import_fn_t)dlsym(handle, "zexDriverImportExternalPointer");
-            if (import_fn) {
-                int32_t ze_ret = import_fn((void *)ze_driver, const_cast<void *>(model_map), model_size);
-                if (ze_ret == 0) {
-                    g_model_imported = true;
-                    fprintf(stderr, "ds4: Level Zero imported %llu MiB — direct GPU access to mmap enabled\n",
-                            (unsigned long long)(model_size >> 20));
-                } else {
-                    fprintf(stderr, "ds4: zexDriverImportExternalPointer failed (%d) — using copy path\n", (int)ze_ret);
-                }
-            } else {
-                fprintf(stderr, "ds4: zexDriverImportExternalPointer not found — using copy path\n");
-            }
-        } else {
-            fprintf(stderr, "ds4: libze_intel_gpu.so not loaded — using copy path\n");
-        }
-    } catch (std::exception &e) {
-        fprintf(stderr, "ds4: Level Zero import error: %s — using copy path\n", e.what());
-    }
+    /* Bulk malloc_host copy is attempted lazily on the first sycl_model_range_ptr
+     * call (when g_queue is available).  If it succeeds, all per-range copies are
+     * replaced by a single one-time memcpy from mmap into USM host memory.
+     * Falls back to per-range cache if the bulk allocation fails. */
 }
 
 /* Helper: f32->f16 conversion kernel (used by f16 matmul batched path). */
@@ -1099,7 +1105,6 @@ extern "C" int ds4_gpu_init(void) {
         g_queue   = new sycl::queue(*g_context, *g_device, ah,
                                     sycl::property_list{
                                         sycl::property::queue::in_order{},
-                                        sycl::ext::intel::property::queue::immediate_command_list{}
                                     });
         g_initialized = 1;
         g_alloc_host = getenv("DS4_SYCL_ALLOC_HOST") != nullptr;
@@ -1124,7 +1129,9 @@ extern "C" int ds4_gpu_init(void) {
  * wait_and_throw() here for performance.  All error propagation is handled
  * by end_commands() or the next explicit sync point. */
 extern "C" void ds4_gpu_clear_cached_model_ranges(void) {
-    if (g_queue) g_queue->wait();
+    if (!g_queue) return;
+    g_queue->wait();
+    if (g_model_host_ptr) return; /* bulk copy — no per-range cache to clear */
     for (auto &r : g_model_ranges)
         r.offset = UINT64_MAX;
 }
@@ -1133,8 +1140,13 @@ extern "C" void ds4_gpu_clear_cached_model_ranges(void) {
 extern "C" void ds4_gpu_cleanup_cached_model_ranges(void) {
     if (!g_queue) return;
     auto &q = *g_queue;
-    for (auto &r : g_model_ranges)
+    if (g_model_host_ptr) {
+        sycl::free(g_model_host_ptr, q);
+        g_model_host_ptr = nullptr;
+    }
+    for (auto &r : g_model_ranges) {
         if (r.device_ptr) sycl::free(r.device_ptr, q);
+    }
     g_model_ranges.clear();
 }
 
@@ -1177,7 +1189,6 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_context     = nullptr;
     g_device      = nullptr;
     g_initialized = 0;
-    g_model_imported = false;
 }
 
 extern "C" uint64_t ds4_gpu_vram_total(void) {
@@ -2444,16 +2455,48 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
     if (weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    fprintf(stderr, "ds4: DEBUG matmul_f16 model_map=%p model_size=%zu woff=%zu wbytes=%zu\n",
+            model_map, (size_t)model_size, (size_t)weight_offset, (size_t)weight_bytes);
     const char *wptr = sycl_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) { fprintf(stderr, "ds4: DEBUG f16 model_range_ptr returned null\n"); return 0; }
     const sycl::half *w = (const sycl::half *)wptr;
     try {
         if (n_tok > 1) {
-            if (!sycl_ensure_f16_buf(n_tok, in_dim)) return 0;
+            fprintf(stderr, "ds4: DEBUG matmul_f16 prefill path, n_tok=%lu out_dim=%lu in_dim=%lu w=%p x->ptr=%p out->ptr=%p\n",
+                    (unsigned long)n_tok, (unsigned long)out_dim, (unsigned long)in_dim,
+                    (void*)w, x->ptr, out->ptr);
+            if (!sycl_ensure_f16_buf(n_tok, in_dim)) { fprintf(stderr, "ds4: DEBUG f16_buf failed\n"); return 0; }
             sycl::half *xh = g_f16_xh;
             const uint64_t xh_count = n_tok * in_dim;
-            sycl_convert_f32_f16(*g_queue, xh_count, (const float *)x->ptr, xh);
+            fprintf(stderr, "ds4: DEBUG about to sycl_convert_f32_f16 (x->ptr=%p xh=%p count=%lu)\n", x->ptr, (void*)xh, (unsigned long)xh_count);
+            try {
+                sycl_convert_f32_f16(*g_queue, xh_count, (const float *)x->ptr, xh);
+                fprintf(stderr, "ds4: DEBUG convert submitted\n");
+            } catch (sycl::exception &e) {
+                fprintf(stderr, "ds4: DEBUG sycl_convert_f32_f16 threw: %s\n", e.what());
+                throw;
+            }
+            fprintf(stderr, "ds4: DEBUG about to wait\n");
+            g_queue->wait();
+            fprintf(stderr, "ds4: DEBUG wait done\n");
             const float alpha = 1.0f, beta = 0.0f;
+            fprintf(stderr, "ds4: DEBUG about to test_kernel (imported pointer read)\n");
+            /* Test: can we read from the imported w pointer in a kernel? */
+            try {
+                g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
+                    uint64_t o = (uint64_t)idx;
+                    float sum = 0.0f;
+                    for (uint64_t i = 0; i < in_dim; i++)
+                        sum += (float)w[o * in_dim + i] * (float)xh[i];
+                    ((float *)out->ptr)[o] = sum;
+                });
+                g_queue->wait();
+                fprintf(stderr, "ds4: DEBUG test_kernel (imported read) OK\n");
+            } catch (sycl::exception &e) {
+                fprintf(stderr, "ds4: DEBUG test_kernel FAILED: %s\n", e.what());
+                throw; // re-throw so original catch catches it
+            }
+            fprintf(stderr, "ds4: DEBUG about to MKL gemm\n");
             oneapi::mkl::blas::gemm(*g_queue,
                                     oneapi::mkl::transpose::trans,
                                     oneapi::mkl::transpose::nontrans,
@@ -2463,6 +2506,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                                     xh, (int64_t)in_dim,
                                     beta,
                                     (float *)out->ptr, (int64_t)out_dim);
+            fprintf(stderr, "ds4: DEBUG MKL gemm done\n");
         } else {
             g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
                 uint64_t o = (uint64_t)idx;
@@ -4643,12 +4687,13 @@ static int sycl_routed_moe_launch(
     const char *gate_w, *up_w, *down_w;
     uint32_t n_uniq = 0;
 
-    if (g_model_imported) {
-        /* Model mmap is Level Zero imported — GPU can read weights directly. */
-        const char *mmap = (const char *)model_map;
-        gate_w = mmap + gate_offset;
-        up_w   = mmap + up_offset;
-        down_w = mmap + down_offset;
+    /* Bulk model copy is active — all weights are already in GPU-accessible
+     * USM host memory, so skip the selective copy entirely. */
+    if (g_model_host_ptr) {
+        gate_w = g_model_host_ptr + gate_offset;
+        up_w   = g_model_host_ptr + up_offset;
+        down_w = g_model_host_ptr + down_offset;
+        n_uniq = n_total_expert;
     } else {
         /* Standard path: allocate USM host buffers and copy selected experts. */
         auto alloc_host = [&](char *&buf, uint64_t &buf_bytes, uint64_t needed, const char *name) {
