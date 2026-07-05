@@ -38,9 +38,12 @@
 - Confirmed Q/K path already well-optimized: qkv_rms_fused path uses pair_tensor for Q_a+K_raw (1 sub), fused Q_norm+K_norm (1 sub), Q_b matmul (1 sub), fused head_norm+Rope (1 sub) = 4 submissions.
 - Confirmed all three weight allocation tiers verified: `malloc_device` (VRAM) for activations, `malloc_host` (pinned host) for weight cache copies via `sycl_model_range_ptr`, `malloc_shared` for a few tensors needing CPU readback.
 - **Level Zero import investigated and blocked by A750 driver bug**: both `zexDriverImportExternalPointer` (bulk) and `zeMemAllocHost(ext_memmap)` (per-range) were tried. The per-range import succeeds (returns valid pointer) but deterministically corrupts subsequent kernel submissions with `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`. A750 driver 12.55.8 bug. All L0 import code has been reverted; the integration uses the copy path (`malloc_host` + CPU `memcpy`) as a stable fallback.
+- **VTune profiling (45s decode, user-mode sampling)**: identified true bottleneck — `func@0x25f780` in `libze_intel_gpu.so` is **50.8% CPU** (L0 sync from USM page migration drain after `g_queue->wait()`), `func@0x1faae0` is **14.1% CPU** (L0 kernel submission). Wait overhead from `ds4_gpu_clear_cached_model_ranges` `wait()` between layers: ~8ms per call × ~774 calls = ~6.2s total.
+- **Slab-based bulk model copy implemented**: replaces per-layer per-range memcpy with 77×2 GiB `sycl::malloc_host` slabs allocated at first use. `g_model_host_ptr` removed — replaced by `g_model_slabs` vector `+ g_slabs_allocated` state. O(1) slab lookup in `sycl_model_range_ptr`. MoE fast path and cleanup functions updated. Frees per-range cache on success.
+- **Single-bulk `malloc_host(153 GiB)` confirmed failing**: Intel GPU driver GEM BO size limit prevents allocating full model size in one chunk. Slab approach works around this with independent 2 GiB allocations.
 
 ### In Progress
-- (none — all identified fusion targets completed; L0 import blocked by driver bug; remaining ~18 subs/layer are fundamental operations with data dependency chains blocking further fusion)
+- **Benchmark slab copy and measure L0 sync impact**: run decode with `DS4_METAL_GRAPH_TOKEN_PROFILE=1` and VTune to verify slabs eliminate per-layer USM page migration sync.
 
 ### Blocked
 - Level Zero mmap import (`zexDriverImportExternalPointer` / `zeMemAllocHost(ext_memmap)`) — per-range import works in isolation but corrupts GPU state in the full integration (A750 driver 12.55.8 bug). All import code reverted to keep the copy path stable.
@@ -67,17 +70,19 @@
 - **Temporary device for Level Zero import**: `ds4_gpu_prepare_model_memory` creates a local `sycl::device(sycl::gpu_selector_v)` instead of using `g_queue` (NULL at model load time). Import still fails at the driver level.
 - **dlsym-based runtime detection**: `zexDriverImportExternalPointer` resolved from `libze_intel_gpu.so.1` at startup. Falls back to selective-copy path on failure. No compile-time Level Zero dependency. Both the `zexDriverImportExternalPointer` and `zeMemAllocHost(ext_memmap)` approaches are now reverted as unusable on A750 12.55.8.
 - **Level Zero import before command graphs**: import would make mmap GPU-accessible, eliminating ALL weight memcpy and the MoE CPU-readback pattern that blocks graph recording. Currently blocked by driver support.
+- **Slab-based bulk copy replaces single-bulk approach**: since `sycl::malloc_host(153 GiB)` failed, split into 2 GiB slabs (77 slabs). Each `sycl::malloc_host(2 GiB)` creates a separate GEM BO, avoiding per-BO size limits while eliminating per-layer model range copies.
+- **Immediate CL does not eliminate L0 sync overhead**: VTune showed ~8ms per kernel launch in `func@0x25f780` (L0 synchronize) even with immediate CL. The UR adapter internally synchronizes between submissions for USM page migration drain. Only way to eliminate this overhead is to avoid USM writes during the hot path.
 
 ## Next Steps
-1. **Benchmark with all fusions enabled**: measure actual throughput improvement. Use `DS4_METAL_GRAPH_TOKEN_PROFILE=1` to compare baseline vs latest.
+1. **Benchmark slab copy and measure L0 sync impact**: run decode with `DS4_METAL_GRAPH_TOKEN_PROFILE=1` to measure throughput. Then run VTune to verify that slabs eliminate the per-layer `g_queue->wait()` USM page migration sync.
 2. **Level Zero import not viable on A750 12.55.8** — the driver bug (`ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` after successful `zeMemAllocHost(ext_memmap)`) prevents any import-based zero-copy approach. No workaround found after extensive debugging (isolation tests pass, integration fails deterministically). A driver update from Intel would be required.
 3. **Explore direct Level Zero submit bypass**: `zeCommandListAppendLaunchKernel` + `zeCommandListClose` + `zeCommandQueueExecuteCommandLists` without SYCL/UR translation to eliminate the 0.05ms UR dispatch overhead. Minimal POC using `libze_intel_gpu.so` via `dlopen`.
-4. **Update `SYCL_BACKEND.md`** with fusion results, stage profiling numbers, submit_overhead findings, and updated overhead distribution.
+4. **Update `SYCL_BACKEND.md`** with fusion results, stage profiling numbers, submit_overhead findings, VTune results, and slab copy implementation.
 
 ## Critical Context
 - Intel Arc A750, 56 GiB/s PCIe Gen4 ×16 bandwidth, ~292 GB system RAM, DS4 model ~141 GB
 - SYCL backend uses in-order queue with Level Zero via oneAPI 2026.0 Unified Runtime (UR)
-- **Current decode perf (after all fusions)**: encode ~3000 ms/token (estimate), execute ~2.2 ms (immediate CL), throughput ~0.33 t/s (up from ~0.22 t/s)
+- **Current decode perf (after all fusions)**: encode ~3000 ms/token (estimate), execute ~2.2 ms (immediate CL), throughput ~0.33 t/s (up from ~0.22 t/s). With slabs expected to reduce per-layer wait overhead from ~8ms to near-zero.
 - **Submit overhead breakdown**: bare submit = 0.05 ms; model range copy (mmap→USM) = 0.35 ms/4 MiB at 12.1 GB/s; average per-submit in real app ~2.1 ms due to varying weight sizes (0.3–58 MiB). The 0.05 ms SYCL/UR overhead is negligible.
 - **USM memcpy is 3–6× slower than plain memcpy** due to Intel GPU driver page tracking interception. 70 MiB USM→USM copy takes 20.5 ms (should be ~3.5 ms at 20 GB/s DDR5).
 - **Total submissions saved per layer**: 10 = 7 (attn_output A) + 1 (shared gate+up+swiglu) + 1 (F16 pair matmul) + 1 (reverse RoPE). Remaining: ~18 subs/layer.

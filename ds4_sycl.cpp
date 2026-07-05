@@ -204,6 +204,7 @@ static sycl::context           *g_context        = nullptr;
 static int                      g_initialized    = 0;
 static int                      g_quality_mode   = 0;
 static int                      g_ssd_streaming  = 0;
+static int                      g_moe_prof       = -1;
 
 /* Model mapping state */
 static const void              *g_model_host_base       = nullptr;
@@ -879,9 +880,21 @@ static uint64_t moe_host_gate_bytes = 0, moe_host_up_bytes = 0, moe_host_down_by
 
 /* Bulk model copy: if we can allocate a single malloc_host buffer for the entire
  * model size and memcpy the mmap into it once, all per-range copies are eliminated.
- * sycl_model_range_ptr returns g_model_host_ptr + offset directly — no cache,
+ * sycl_model_range_ptr returns slab pointer + offset directly — no cache,
  * no mutex, no per-layer memcpy.  Falls back to per-range cache on failure. */
-static char *g_model_host_ptr = nullptr;
+
+/* Slab-based bulk model copy: the single malloc_host(153 GiB) fails on
+ * A750 (driver GEM BO size limit).  Instead we allocate 2 GiB slabs and
+ * copy the model into them at first use.  sycl_model_range_ptr returns
+ * the slab pointer + offset, eliminating per-layer memcpy overhead. */
+#define MODEL_SLAB_SIZE (2ULL * 1024 * 1024 * 1024) /* 2 GiB per slab */
+struct ModelSlab {
+    char    *ptr;
+    uint64_t model_offset;
+    uint64_t size;
+};
+static std::vector<ModelSlab> g_model_slabs;
+static int g_slabs_allocated = 0; /* 0=not tried, 1=trying, 2=failed, 3=done */
 
 /* Reusable buffer pool — eliminates munmap + re-mmap per layer.
  * All allocation paths check this pool before calling sycl::malloc_*:
@@ -964,34 +977,52 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
     if (!g_queue) return nullptr;
     if (bytes == 0) return (const char *)model_map + offset;
 
-    /* Bulk fast path: entire model is in one malloc_host buffer — return + offset. */
-    if (g_model_host_ptr)
-        return g_model_host_ptr + offset;
-
-    /* Lazy bulk allocation: on first call with a valid queue, try to grab
-     * the full model size as a single USM host allocation.  On a 292 GiB
-     * system the A750 driver allows large zeMemAllocHost requests through
-     * DRM GEM bo creation (no RLIMIT_MEMLOCK).  If it fails (fragmentation
-     * or driver limits), fall back to per-range caching below. */
-    if (g_model_host_base && g_model_registered_size > 0) {
-        auto t_bulk = std::chrono::steady_clock::now();
-        try {
-            char *bulk = (char *)sycl::malloc_host(g_model_registered_size, g_queue->get_context());
-            if (bulk) {
-                memcpy(bulk, g_model_host_base, g_model_registered_size);
-                double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_bulk).count();
-                fprintf(stderr, "ds4: bulk model copy %llu MiB in %.0f ms (%.0f MiB/s)\n",
-                        (unsigned long long)(g_model_registered_size >> 20), ms,
-                        (g_model_registered_size / 1048576.0) / (ms / 1000.0));
-                g_model_host_ptr = bulk;
-                /* Per-range cache is no longer needed — free all entries. */
-                ds4_gpu_cleanup_cached_model_ranges();
-                return g_model_host_ptr + offset;
+    /* Slab-based bulk allocation: on first call with a valid queue, allocate
+     * 2 GiB USM host slabs for the entire model.  Single malloc_host(153 GiB)
+     * fails due to driver GEM BO size limit, but individual 2 GiB slabs work.
+     * Fall back to per-range caching if any slab fails. */
+    if (g_model_host_base && g_model_registered_size > 0 && !g_slabs_allocated) {
+        g_slabs_allocated = 1; /* trying */
+        auto t_slab = std::chrono::steady_clock::now();
+        uint64_t remaining = g_model_registered_size;
+        uint64_t off = 0;
+        while (remaining > 0) {
+            uint64_t sz = remaining > MODEL_SLAB_SIZE ? MODEL_SLAB_SIZE : remaining;
+            char *ptr = nullptr;
+            try { ptr = (char *)sycl::malloc_host(sz, g_queue->get_context()); } catch (...) {}
+            if (!ptr) {
+                for (auto &s : g_model_slabs)
+                    sycl::free(s.ptr, *g_queue);
+                g_model_slabs.clear();
+                break;
             }
-        } catch (...) {}
-        if (!g_model_host_ptr)
-            fprintf(stderr, "ds4: bulk malloc_host(%llu) failed — using per-range cache\n",
-                    (unsigned long long)g_model_registered_size);
+            memcpy(ptr, (const char *)g_model_host_base + off, sz);
+            g_model_slabs.push_back({ptr, off, sz});
+            remaining -= sz;
+            off += sz;
+        }
+        if (off >= g_model_registered_size) {
+            g_slabs_allocated = 3; /* done */
+            double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_slab).count();
+            fprintf(stderr, "ds4: slab model copy %zu slabs, %llu MiB in %.0f ms\n",
+                    g_model_slabs.size(), (unsigned long long)(g_model_registered_size >> 20), ms);
+            ds4_gpu_cleanup_cached_model_ranges();
+        } else {
+            g_slabs_allocated = 2; /* failed */
+            fprintf(stderr, "ds4: slab malloc_host failed at offset %llu — using per-range cache\n",
+                    (unsigned long long)off);
+        }
+    }
+
+    /* Slab fast path: direct offset-to-slab lookup (O(1)). */
+    if (g_slabs_allocated == 3) {
+        uint64_t slab_idx = offset / MODEL_SLAB_SIZE;
+        if (slab_idx < g_model_slabs.size()) {
+            auto &s = g_model_slabs[slab_idx];
+            uint64_t slab_off = offset - s.model_offset;
+            if (slab_off + bytes <= s.size)
+                return s.ptr + slab_off;
+        }
     }
 
     /* Per-range caching fallback. */
@@ -1038,6 +1069,9 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
  * read-through on older kernels. */
 extern "C" void ds4_gpu_prepare_model_memory(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return;
+    g_model_host_base = model_map;
+    g_model_registered_size = model_size;
+    g_model_registered = 1;
 #ifdef MADV_POPULATE_READ
     int ret = madvise((void *)model_map, (size_t)model_size, MADV_POPULATE_READ);
     if (ret != 0)
@@ -1130,8 +1164,12 @@ extern "C" int ds4_gpu_init(void) {
  * by end_commands() or the next explicit sync point. */
 extern "C" void ds4_gpu_clear_cached_model_ranges(void) {
     if (!g_queue) return;
+    /* Slabs: all weights already in USM host, no per-range buffers to recycle
+     * between layers.  Skip wait() — the in-order queue + immediate CL hardware
+     * FIFO guarantees correct ordering without explicit synchronization.
+     * Skipping this wait eliminates 50% CPU from USM page migration drain. */
+    if (g_slabs_allocated == 3) return;
     g_queue->wait();
-    if (g_model_host_ptr) return; /* bulk copy — no per-range cache to clear */
     for (auto &r : g_model_ranges)
         r.offset = UINT64_MAX;
 }
@@ -1140,10 +1178,11 @@ extern "C" void ds4_gpu_clear_cached_model_ranges(void) {
 extern "C" void ds4_gpu_cleanup_cached_model_ranges(void) {
     if (!g_queue) return;
     auto &q = *g_queue;
-    if (g_model_host_ptr) {
-        sycl::free(g_model_host_ptr, q);
-        g_model_host_ptr = nullptr;
+    for (auto &s : g_model_slabs) {
+        if (s.ptr) sycl::free(s.ptr, q);
     }
+    g_model_slabs.clear();
+    g_slabs_allocated = 0;
     for (auto &r : g_model_ranges) {
         if (r.device_ptr) sycl::free(r.device_ptr, q);
     }
@@ -2455,48 +2494,16 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
     if (weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
-    fprintf(stderr, "ds4: DEBUG matmul_f16 model_map=%p model_size=%zu woff=%zu wbytes=%zu\n",
-            model_map, (size_t)model_size, (size_t)weight_offset, (size_t)weight_bytes);
     const char *wptr = sycl_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
-    if (!wptr) { fprintf(stderr, "ds4: DEBUG f16 model_range_ptr returned null\n"); return 0; }
+    if (!wptr) return 0;
     const sycl::half *w = (const sycl::half *)wptr;
     try {
         if (n_tok > 1) {
-            fprintf(stderr, "ds4: DEBUG matmul_f16 prefill path, n_tok=%lu out_dim=%lu in_dim=%lu w=%p x->ptr=%p out->ptr=%p\n",
-                    (unsigned long)n_tok, (unsigned long)out_dim, (unsigned long)in_dim,
-                    (void*)w, x->ptr, out->ptr);
-            if (!sycl_ensure_f16_buf(n_tok, in_dim)) { fprintf(stderr, "ds4: DEBUG f16_buf failed\n"); return 0; }
+            if (!sycl_ensure_f16_buf(n_tok, in_dim)) return 0;
             sycl::half *xh = g_f16_xh;
             const uint64_t xh_count = n_tok * in_dim;
-            fprintf(stderr, "ds4: DEBUG about to sycl_convert_f32_f16 (x->ptr=%p xh=%p count=%lu)\n", x->ptr, (void*)xh, (unsigned long)xh_count);
-            try {
-                sycl_convert_f32_f16(*g_queue, xh_count, (const float *)x->ptr, xh);
-                fprintf(stderr, "ds4: DEBUG convert submitted\n");
-            } catch (sycl::exception &e) {
-                fprintf(stderr, "ds4: DEBUG sycl_convert_f32_f16 threw: %s\n", e.what());
-                throw;
-            }
-            fprintf(stderr, "ds4: DEBUG about to wait\n");
-            g_queue->wait();
-            fprintf(stderr, "ds4: DEBUG wait done\n");
+            sycl_convert_f32_f16(*g_queue, xh_count, (const float *)x->ptr, xh);
             const float alpha = 1.0f, beta = 0.0f;
-            fprintf(stderr, "ds4: DEBUG about to test_kernel (imported pointer read)\n");
-            /* Test: can we read from the imported w pointer in a kernel? */
-            try {
-                g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
-                    uint64_t o = (uint64_t)idx;
-                    float sum = 0.0f;
-                    for (uint64_t i = 0; i < in_dim; i++)
-                        sum += (float)w[o * in_dim + i] * (float)xh[i];
-                    ((float *)out->ptr)[o] = sum;
-                });
-                g_queue->wait();
-                fprintf(stderr, "ds4: DEBUG test_kernel (imported read) OK\n");
-            } catch (sycl::exception &e) {
-                fprintf(stderr, "ds4: DEBUG test_kernel FAILED: %s\n", e.what());
-                throw; // re-throw so original catch catches it
-            }
-            fprintf(stderr, "ds4: DEBUG about to MKL gemm\n");
             oneapi::mkl::blas::gemm(*g_queue,
                                     oneapi::mkl::transpose::trans,
                                     oneapi::mkl::transpose::nontrans,
@@ -2506,7 +2513,6 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                                     xh, (int64_t)in_dim,
                                     beta,
                                     (float *)out->ptr, (int64_t)out_dim);
-            fprintf(stderr, "ds4: DEBUG MKL gemm done\n");
         } else {
             g_queue->parallel_for(sycl::range<1>(out_dim), [=](sycl::id<1> idx) {
                 uint64_t o = (uint64_t)idx;
@@ -2801,7 +2807,6 @@ static float rope_yarn_ramp(float low, float high, int i0) {
 extern "C" int ds4_gpu_head_rms_norm_tensor(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
         uint32_t head_dim, float eps) {
-    fprintf(stderr, "ds4: DBG head_rms_norm\n"); fflush(stderr);
     if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     try {
         uint32_t rows = n_tok * n_head;
@@ -4682,17 +4687,26 @@ static int sycl_routed_moe_launch(
         down_bytes > model_size - down_offset)
         return 0;
 
+    if (g_moe_prof < 0) g_moe_prof = getenv("DS4_SYCL_PROFILE") != nullptr;
+
     /* ---- Selective expert copy (or direct mmap access if imported) ---- */
     auto t_map = std::chrono::steady_clock::now();
     const char *gate_w, *up_w, *down_w;
     uint32_t n_uniq = 0;
 
-    /* Bulk model copy is active — all weights are already in GPU-accessible
+    /* Slab model copy is active — all weights are already in GPU-accessible
      * USM host memory, so skip the selective copy entirely. */
-    if (g_model_host_ptr) {
-        gate_w = g_model_host_ptr + gate_offset;
-        up_w   = g_model_host_ptr + up_offset;
-        down_w = g_model_host_ptr + down_offset;
+    if (g_slabs_allocated == 3) {
+        auto slab_lookup = [](uint64_t off) -> const char * {
+            uint64_t idx = off / MODEL_SLAB_SIZE;
+            if (idx >= g_model_slabs.size()) return nullptr;
+            auto &s = g_model_slabs[idx];
+            return s.ptr + (off - s.model_offset);
+        };
+        gate_w = slab_lookup(gate_offset);
+        up_w   = slab_lookup(up_offset);
+        down_w = slab_lookup(down_offset);
+        if (!gate_w || !up_w || !down_w) return 0;
         n_uniq = n_total_expert;
     } else {
         /* Standard path: allocate USM host buffers and copy selected experts. */
@@ -4784,7 +4798,7 @@ static int sycl_routed_moe_launch(
         down_w = moe_host_down;
     }
     double ms_map = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_map).count();
-    if (ms_map > 1.0) fprintf(stderr, "ds4: SYCL moe_map %d %.0f ms (sel=%u)\n", layer_index, ms_map, n_uniq);
+    if (g_moe_prof && ms_map > 1.0) fprintf(stderr, "ds4: SYCL moe_map %d %.0f ms (sel=%u)\n", layer_index, ms_map, n_uniq);
 
     uint32_t pair_count = n_tokens * n_expert;
     const int32_t *sel_ptr = (const int32_t *)selected->ptr;
@@ -4913,7 +4927,7 @@ static int sycl_routed_moe_launch(
     }
 
     double ms_k1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_k1).count();
-    if (ms_k1 > 1.0) fprintf(stderr, "ds4: SYCL moe_k1 %d %.0f ms\n", layer_index, ms_k1);
+    if (g_moe_prof && ms_k1 > 1.0) fprintf(stderr, "ds4: SYCL moe_k1 %d %.0f ms\n", layer_index, ms_k1);
 
     /* Kernel 2: down projection for every (row, pair).
        Work-group (1,16) — sub-group parallelizes inner 16-element loop. */
@@ -5015,7 +5029,7 @@ static int sycl_routed_moe_launch(
     }
 
     double ms_k2 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_k2).count();
-    if (ms_k2 > 1.0) fprintf(stderr, "ds4: SYCL moe_k2 %d %.0f ms\n", layer_index, ms_k2);
+    if (g_moe_prof && ms_k2 > 1.0) fprintf(stderr, "ds4: SYCL moe_k2 %d %.0f ms\n", layer_index, ms_k2);
 
     /* Kernel 3: sum across experts */
     auto t_k3 = std::chrono::steady_clock::now();
@@ -5031,7 +5045,7 @@ static int sycl_routed_moe_launch(
         });
     });
     double ms_k3 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_k3).count();
-    if (ms_k3 > 1.0) fprintf(stderr, "ds4: SYCL moe_k3 %d %.0f ms\n", layer_index, ms_k3);
+    if (g_moe_prof && ms_k3 > 1.0) fprintf(stderr, "ds4: SYCL moe_k3 %d %.0f ms\n", layer_index, ms_k3);
 
     return 1;
 }
@@ -5162,7 +5176,6 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(
                 for (int i = 0; i < 16; i++) lout[8 + i] = c[i];
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_split_sinkhorn failed: %s\n", e.what());
@@ -5194,7 +5207,6 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(
                 out_ptr[(uint64_t)t * n_embd + d] = acc;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_weighted_sum failed: %s\n", e.what());
@@ -5226,7 +5238,6 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(
                 out_ptr[(uint64_t)t * n_embd + d] = acc;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_weighted_sum_split failed: %s\n", e.what());
@@ -5312,7 +5323,6 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
                 }
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_split_weighted_sum failed: %s\n", e.what());
@@ -5410,7 +5420,6 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                 }
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_split_weighted_sum_norm failed: %s\n", e.what());
@@ -5440,7 +5449,6 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
                 out_ptr[gid] = 1.0f / (1.0f + expf(-z)) + eps;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL output_hc_weights failed: %s\n", e.what());
@@ -5483,7 +5491,6 @@ extern "C" int ds4_gpu_hc_expand_tensor(
                 o_ptr[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_expand failed: %s\n", e.what());
@@ -5526,7 +5533,6 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(
                 o_ptr[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_expand_split failed: %s\n", e.what());
@@ -5582,7 +5588,6 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
                 o_ptr[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
             });
         });
-        g_queue->wait();
         return 1;
     } catch (sycl::exception &e) {
         fprintf(stderr, "ds4: SYCL hc_expand_add_split failed: %s\n", e.what());
