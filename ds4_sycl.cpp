@@ -977,47 +977,48 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
     if (!g_queue) return nullptr;
     if (bytes == 0) return (const char *)model_map + offset;
 
-    /* Slab-based bulk allocation: on first call with a valid queue, allocate
-     * 2 GiB USM host slabs for the entire model.  Single malloc_host(153 GiB)
-     * fails due to driver GEM BO size limit, but individual 2 GiB slabs work.
-     * Fall back to per-range caching if any slab fails. */
+    /* Lazy slab allocation: allocate 2 GiB slabs on first access per offset.
+     * Single malloc_host(153 GiB) fails due to driver GEM BO size limit, and
+     * eager 77×2 GiB copy causes memory pressure (154 GiB mmap + 154 GiB
+     * malloc_host exceeds 292 GiB RAM).  Lazy copy avoids both issues:
+     * each slab is allocated + memcpy'd only when first accessed. */
     if (g_model_host_base && g_model_registered_size > 0 && !g_slabs_allocated) {
-        g_slabs_allocated = 1; /* trying */
-        auto t_slab = std::chrono::steady_clock::now();
-        uint64_t remaining = g_model_registered_size;
-        uint64_t off = 0;
-        while (remaining > 0) {
-            uint64_t sz = remaining > MODEL_SLAB_SIZE ? MODEL_SLAB_SIZE : remaining;
+        g_slabs_allocated = 3; /* active — try to allocate slabs on demand */
+    }
+    if (g_slabs_allocated == 3) {
+        uint64_t slab_idx = offset / MODEL_SLAB_SIZE;
+        /* Allocate slabs up to and including slab_idx (fill gaps). */
+        bool ok = true;
+        while (g_model_slabs.size() <= slab_idx && ok) {
+            uint64_t i = g_model_slabs.size();
+            uint64_t slab_off = i * MODEL_SLAB_SIZE;
+            uint64_t slab_sz = (g_model_registered_size - slab_off) > MODEL_SLAB_SIZE
+                               ? MODEL_SLAB_SIZE
+                               : (g_model_registered_size - slab_off);
             char *ptr = nullptr;
-            try { ptr = (char *)sycl::malloc_host(sz, g_queue->get_context()); } catch (...) {}
+            try { ptr = (char *)sycl::malloc_host(slab_sz, g_queue->get_context()); } catch (...) {}
             if (!ptr) {
+                ok = false;
                 for (auto &s : g_model_slabs)
                     sycl::free(s.ptr, *g_queue);
                 g_model_slabs.clear();
-                break;
+                g_slabs_allocated = 2;
+                fprintf(stderr, "ds4: slab malloc_host(%llu) failed at slab %zu — using per-range cache\n",
+                        (unsigned long long)slab_sz, i);
+            } else {
+                memcpy(ptr, (const char *)g_model_host_base + slab_off, slab_sz);
+                /* Drop the page cache for this slab's mmap range.
+                 * posix_fadvise(POSIX_FADV_DONTNEED) actually frees clean
+                 * page cache pages from the file, unlike madvise(MADV_DONTNEED)
+                 * which only unmaps them from the process RSS.  This keeps
+                 * total memory at ~141 GB (shifting from page cache to pinned
+                 * slabs) instead of spiking to 295 GB. */
+                if (g_model_fd >= 0)
+                    posix_fadvise(g_model_fd, slab_off, slab_sz, POSIX_FADV_DONTNEED);
+                g_model_slabs.push_back({ptr, slab_off, slab_sz});
             }
-            memcpy(ptr, (const char *)g_model_host_base + off, sz);
-            g_model_slabs.push_back({ptr, off, sz});
-            remaining -= sz;
-            off += sz;
         }
-        if (off >= g_model_registered_size) {
-            g_slabs_allocated = 3; /* done */
-            double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_slab).count();
-            fprintf(stderr, "ds4: slab model copy %zu slabs, %llu MiB in %.0f ms\n",
-                    g_model_slabs.size(), (unsigned long long)(g_model_registered_size >> 20), ms);
-            ds4_gpu_cleanup_cached_model_ranges();
-        } else {
-            g_slabs_allocated = 2; /* failed */
-            fprintf(stderr, "ds4: slab malloc_host failed at offset %llu — using per-range cache\n",
-                    (unsigned long long)off);
-        }
-    }
-
-    /* Slab fast path: direct offset-to-slab lookup (O(1)). */
-    if (g_slabs_allocated == 3) {
-        uint64_t slab_idx = offset / MODEL_SLAB_SIZE;
-        if (slab_idx < g_model_slabs.size()) {
+        if (ok && g_slabs_allocated == 3) {
             auto &s = g_model_slabs[slab_idx];
             uint64_t slab_off = offset - s.model_offset;
             if (slab_off + bytes <= s.size)
@@ -1025,7 +1026,9 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    /* Per-range caching fallback. */
+    /* Per-range caching fallback.
+     * When slabs are active, copy from slab pages (pinned, fast) instead of
+     * from the mmap (which may have its page cache freed by posix_fadvise). */
     auto t0 = std::chrono::steady_clock::now();
     bool is_expert = (what[0] == 'm' && what[1] == 'o' && what[2] == 'e' && what[3] == '_');
     {
@@ -1036,8 +1039,25 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
         }
         for (auto &r : g_model_ranges) {
             if (r.host_base == model_map && r.bytes == bytes && r.offset == UINT64_MAX && r.device_ptr) {
-                const char *src = (const char *)model_map + offset;
-                memcpy(r.device_ptr, src, bytes);
+                if (g_slabs_allocated == 3) {
+                    uint64_t off = offset;
+                    uint64_t rem = bytes;
+                    uint64_t dst_off = 0;
+                    while (rem > 0) {
+                        uint64_t slab_idx = off / MODEL_SLAB_SIZE;
+                        if (slab_idx >= g_model_slabs.size()) break;
+                        auto &s = g_model_slabs[slab_idx];
+                        uint64_t slab_off = off - s.model_offset;
+                        uint64_t chunk = rem < s.size - slab_off ? rem : s.size - slab_off;
+                        memcpy((char *)r.device_ptr + dst_off, s.ptr + slab_off, chunk);
+                        off += chunk;
+                        rem -= chunk;
+                        dst_off += chunk;
+                    }
+                } else {
+                    const char *src = (const char *)model_map + offset;
+                    memcpy(r.device_ptr, src, bytes);
+                }
                 r.offset = offset;
                 return r.device_ptr;
             }
@@ -1048,8 +1068,25 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
         char *dptr = (char *)sycl::malloc_host(bytes, g_queue->get_context());
         if (!dptr) { fprintf(stderr, "ds4: sycl_model_range_ptr(%s) malloc_host failed for %lu bytes\n", what, (unsigned long)bytes); return nullptr; }
         double ms_alloc = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_alloc).count();
-        const char *src = (const char *)model_map + offset;
-        memcpy(dptr, src, bytes);
+        if (g_slabs_allocated == 3) {
+            uint64_t off = offset;
+            uint64_t rem = bytes;
+            uint64_t dst_off = 0;
+            while (rem > 0) {
+                uint64_t slab_idx = off / MODEL_SLAB_SIZE;
+                if (slab_idx >= g_model_slabs.size()) break;
+                auto &s = g_model_slabs[slab_idx];
+                uint64_t slab_off = off - s.model_offset;
+                uint64_t chunk = rem < s.size - slab_off ? rem : s.size - slab_off;
+                memcpy((char *)dptr + dst_off, s.ptr + slab_off, chunk);
+                off += chunk;
+                rem -= chunk;
+                dst_off += chunk;
+            }
+        } else {
+            const char *src = (const char *)model_map + offset;
+            memcpy(dptr, src, bytes);
+        }
         double ms_tot = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
         {
             std::lock_guard<std::mutex> lock(g_model_ranges_mutex);
@@ -1060,37 +1097,20 @@ static const char *sycl_model_range_ptr(const void *model_map, uint64_t offset, 
     } catch (...) { return nullptr; }
 }
 
-/* Pre-fault model mmap pages to avoid page faults during GPU memcpy submission.
- * Without this, each cold 1+ GiB memcpy from the mmap'd file triggers ~300K page
- * faults in the Level Zero driver's page-pinning path, adding ~600 ms of CPU
- * submission overhead per copy.
- * On Linux 5.4+, MADV_POPULATE_READ faults all pages synchronously into the page
- * cache without requiring CAP_IPC_LOCK (unlike mlock).  Falls back to sequential
- * read-through on older kernels. */
 extern "C" void ds4_gpu_prepare_model_memory(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return;
     g_model_host_base = model_map;
     g_model_registered_size = model_size;
     g_model_registered = 1;
+    /* Pre-fault the entire mmap so slab memcpy doesn't suffer per-page disk
+     * faults.  Without this, the memcpy from mmap→malloc_host faults each
+     * 4K page from the backing file — ~37M page faults at ~1ms each = OOM.
+     * The page cache pages are freed per-slab by posix_fadvise(DONTNEED)
+     * on the model fd, keeping total resident memory at ~141 GB (shifting
+     * from page cache to pinned slabs) instead of 295 GB. */
 #ifdef MADV_POPULATE_READ
-    int ret = madvise((void *)model_map, (size_t)model_size, MADV_POPULATE_READ);
-    if (ret != 0)
-        fprintf(stderr, "ds4: madvise(MADV_POPULATE_READ) failed: %s\n", strerror(errno));
-    else
-        fprintf(stderr, "ds4: pre-faulted %llu MiB of model pages\n",
-                (unsigned long long)(model_size >> 20));
-#else
-    const volatile char *p = (const volatile char *)model_map;
-    const char *end = (const char *)model_map + model_size;
-    volatile char sink = 0;
-    for (; p < end; p += 4096) sink += *p;
-    (void)sink;
+    madvise((void *)model_map, (size_t)model_size, MADV_POPULATE_READ);
 #endif
-
-    /* Bulk malloc_host copy is attempted lazily on the first sycl_model_range_ptr
-     * call (when g_queue is available).  If it succeeds, all per-range copies are
-     * replaced by a single one-time memcpy from mmap into USM host memory.
-     * Falls back to per-range cache if the bulk allocation fails. */
 }
 
 /* Helper: f32->f16 conversion kernel (used by f16 matmul batched path). */
@@ -4695,17 +4715,13 @@ static int sycl_routed_moe_launch(
     uint32_t n_uniq = 0;
 
     /* Slab model copy is active — all weights are already in GPU-accessible
-     * USM host memory, so skip the selective copy entirely. */
+     * USM host memory, so skip the selective copy entirely.
+     * Use sycl_model_range_ptr (which lazily allocates slabs on first
+     * access for each slab index) instead of direct offset math. */
     if (g_slabs_allocated == 3) {
-        auto slab_lookup = [](uint64_t off) -> const char * {
-            uint64_t idx = off / MODEL_SLAB_SIZE;
-            if (idx >= g_model_slabs.size()) return nullptr;
-            auto &s = g_model_slabs[idx];
-            return s.ptr + (off - s.model_offset);
-        };
-        gate_w = slab_lookup(gate_offset);
-        up_w   = slab_lookup(up_offset);
-        down_w = slab_lookup(down_offset);
+        gate_w = sycl_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w   = sycl_model_range_ptr(model_map, up_offset,   gate_bytes, "moe_up");
+        down_w = sycl_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
         if (!gate_w || !up_w || !down_w) return 0;
         n_uniq = n_total_expert;
     } else {
